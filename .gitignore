@@ -15,3 +15,4 @@ BOSS_OR4_Guida_Workflow.docx
 .gitignore
 README.md
 BOSS_recordings.yolov11 (2)
+__pycache__
