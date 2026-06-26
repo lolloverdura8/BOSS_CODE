@@ -336,8 +336,8 @@ def build_report(model_name, config, metrics, df_metrics,
 def count_onnx_flops_params(onnx_path, input_shape=None, input_name=None,
                             csv_tmp_path=None):
     """
-    Conta MACs/parametri su grafo ONNX (contatore uniforme per tutti i notebook).
-    Ritorna dict {params, gmacs, gflops, method}.
+    Conta MACs/parametri su grafo ONNX con onnx-tool (contatore uniforme per
+    tutti i notebook). Ritorna dict {params, gmacs, gflops}.
 
     GMACs = MACs / 1e9 ; GFLOPs = 2 * GMACs (1 MAC = 2 FLOP).
 
@@ -346,32 +346,7 @@ def count_onnx_flops_params(onnx_path, input_shape=None, input_name=None,
       input dinamiche. Se l'export e' a shape fissa, lasciarli None.
     - csv_tmp_path: file CSV temporaneo per il profilo per-nodo (default accanto
       all'onnx).
-
-    Prova prima onnx-tool (profilo per-nodo completo). Se onnx-tool non riesce a
-    profilare il grafo (es. detector con NMS embedded o modelli quantizzati QDQ,
-    che generano errori di shape inference), ripiega su un conteggio dei soli
-    layer di calcolo (Conv/ConvTranspose/Gemm/MatMul) via shape inference ONNX:
-    box-decode e NMS hanno MACs trascurabili e restano esclusi per costruzione.
     """
-    onnx_path = str(onnx_path)
-    try:
-        res = _count_onnx_tool(onnx_path, input_shape, input_name, csv_tmp_path)
-        res["method"] = "onnx_tool"
-        return res
-    except Exception as e_tool:
-        try:
-            res = _count_via_shape_inference(onnx_path, input_shape, input_name)
-            res["method"] = "shape_inference"
-            return res
-        except Exception as e_fb:
-            raise RuntimeError(
-                f"onnx-tool fallito ({e_tool}); fallback shape-inference fallito ({e_fb})"
-            )
-
-
-def _count_onnx_tool(onnx_path, input_shape=None, input_name=None,
-                     csv_tmp_path=None):
-    """Profilo MACs/parametri per-nodo con onnx-tool."""
     import onnx_tool
     from pathlib import Path
 
@@ -409,90 +384,3 @@ def _count_onnx_tool(onnx_path, input_shape=None, input_name=None,
 
     gmacs = total_macs / 1e9
     return {"params": total_params, "gmacs": gmacs, "gflops": 2.0 * gmacs}
-
-
-def _count_via_shape_inference(onnx_path, input_shape=None, input_name=None):
-    """
-    Fallback al profilo onnx-tool: MACs/parametri dei soli layer di calcolo
-    (Conv/ConvTranspose/Gemm/MatMul) via shape inference ONNX. Pensato per grafi
-    che onnx-tool non profila (detector con NMS embedded, modelli quantizzati
-    QDQ). prod(weight_shape) e' invariante a permutazioni, quindi eventuali
-    Transpose/Dequantize sul percorso dei pesi non alterano il conteggio.
-    """
-    import onnx
-    from onnx import shape_inference
-
-    model = onnx.load(str(onnx_path))
-    graph = model.graph
-
-    # Batch dinamico -> shape concreta sull'input, per abilitare l'inferenza.
-    if input_shape is not None and input_name is not None:
-        for inp in graph.input:
-            if inp.name == input_name:
-                dim = inp.type.tensor_type.shape.dim
-                del dim[:]
-                for d in input_shape:
-                    dim.add().dim_value = int(d)
-
-    inferred = shape_inference.infer_shapes(model, strict_mode=False,
-                                            data_prop=True)
-
-    shapes = {}
-    for vi in (list(inferred.graph.value_info)
-               + list(inferred.graph.input)
-               + list(inferred.graph.output)):
-        shapes[vi.name] = [d.dim_value for d in vi.type.tensor_type.shape.dim]
-
-    init_shape = {init.name: list(init.dims) for init in graph.initializer}
-    producer = {o: n for n in graph.node for o in n.output}
-
-    def _prod(xs):
-        p = 1
-        for x in xs:
-            p *= int(x)
-        return p
-
-    def _resolve_shape(name, _depth=0):
-        """Shape di un tensore, risalendo Dequantize/Quantize/Cast/Transpose."""
-        s = shapes.get(name)
-        if s and 0 not in s:
-            return s
-        if name in init_shape:
-            return init_shape[name]
-        n = producer.get(name)
-        if n is not None and _depth < 8 and n.op_type in (
-                "DequantizeLinear", "QuantizeLinear", "Cast", "Transpose"):
-            return _resolve_shape(n.input[0], _depth + 1)
-        return s
-
-    total_macs = 0
-    total_params = 0
-    for node in graph.node:
-        if node.op_type in ("Conv", "ConvTranspose"):
-            w = _resolve_shape(node.input[1])
-            out = shapes.get(node.output[0])
-            if not w or not out or len(out) < 3 or 0 in w:
-                continue
-            spatial_out = out[2:]
-            if not spatial_out or 0 in spatial_out:
-                continue
-            total_macs += _prod(spatial_out) * _prod(w)
-            total_params += _prod(w)
-        elif node.op_type in ("Gemm", "MatMul"):
-            b = _resolve_shape(node.input[1])
-            out = shapes.get(node.output[0])
-            if not b or not out or len(b) < 2 or 0 in out or 0 in b:
-                continue
-            if node.op_type == "MatMul":
-                k = b[-2]
-            else:  # Gemm: B e' [K,N] o [N,K]; K = dim di B diverso da N = out[-1]
-                k = b[0] if b[1] == out[-1] else b[1]
-            total_macs += _prod(out) * int(k)
-            total_params += _prod(b)
-
-    if total_macs == 0:
-        raise RuntimeError("shape inference: nessun layer Conv/Gemm conteggiato "
-                           "(shape non risolte)")
-
-    gmacs = total_macs / 1e9
-    return {"params": int(total_params), "gmacs": gmacs, "gflops": 2.0 * gmacs}
