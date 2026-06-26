@@ -359,13 +359,16 @@ def count_onnx_flops_params(onnx_path, input_shape=None, input_name=None,
         from onnx_tool import create_ndarray_f32
         inputs = {input_name: create_ndarray_f32(tuple(input_shape))}
 
-    # model_profile stampa il profilo e (savenode) salva il dettaglio per-nodo.
-    onnx_tool.model_profile(onnx_path, inputs, savenode=csv_tmp_path)
+    # model_profile stampa il profilo e (save_profile) salva il dettaglio per-nodo.
+    onnx_tool.model_profile(onnx_path, inputs, save_profile=csv_tmp_path)
 
     df = pd.read_csv(csv_tmp_path)
     cols = {c.strip().lower(): c for c in df.columns}
-    mac_col = cols.get("macs") or cols.get("forwardmacs")
-    par_col = cols.get("params") or cols.get("parameters") or cols.get("weight")
+    # onnx-tool recente nomina la colonna 'Forward_MACs'; match robusto per versione.
+    mac_col = next((orig for low, orig in cols.items()
+                    if "mac" in low and "back" not in low), None)
+    par_col = next((orig for low, orig in cols.items() if "param" in low), None) \
+        or cols.get("weight")
     name_col = df.columns[0]
     if mac_col is None or par_col is None:
         raise RuntimeError(f"Colonne MACs/Params non trovate nel CSV onnx-tool: {list(df.columns)}")
