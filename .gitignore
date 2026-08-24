@@ -1,0 +1,14 @@
+# .gitignore
+**/.venv/
+**/venv/
+**/checkpoints/
+**/weights/
+**/outputs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.mp4
+__pycache__/
+*.pyc
+.vscode/
