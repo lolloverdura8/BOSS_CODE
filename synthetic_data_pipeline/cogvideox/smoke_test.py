@@ -6,7 +6,7 @@ import torch
 from diffusers import CogVideoXPipeline
 from diffusers.utils import export_to_video
 
-MODEL_ID = "THUDM/CogVideoX-5b"
+MODEL_ID = "THUDM/CogVideoX-2b"
 
 # Risoluzione nativa del modello (sample_height=60, sample_width=90,
 # vae_scale_factor_spatial=8 -> 480x720): forzare la risoluzione nativa di
@@ -21,9 +21,11 @@ GUIDANCE = 6.0    # default nativo CogVideoX (Wan usa 5.0: modelli diversi, non 
 FPS = 8           # fps nativo
 
 # A differenza di Wan, CogVideoX non ha un vincolo documentato di VAE in fp32:
-# l'intera pipeline viene caricata in bf16. Se in fase di verifica emergono
-# artefatti di decodifica, passare a VAE separato in fp32 come per Wan.
-pipe = CogVideoXPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+# l'intera pipeline viene caricata in fp16 (model card THUDM: CogVideoX-2b
+# raccomanda fp16, a differenza del 5b che raccomanda bf16). Se in fase di
+# verifica emergono artefatti di decodifica, passare a VAE separato in fp32
+# come per Wan.
+pipe = CogVideoXPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16)
 pipe.enable_model_cpu_offload()
 pipe.vae.enable_tiling()
 
@@ -56,6 +58,6 @@ elapsed = time.time() - t0
 
 export_to_video(frames, "outputs/smoke_test.mp4", fps=FPS)
 
-print("frames:", len(frames), frames[0].shape, "durata: %.2f s" % (len(frames) / FPS))
+print("frames:", len(frames), frames[0].size, "durata: %.2f s" % (len(frames) / FPS))
 print("tempo generazione: %.1f s" % elapsed)
 print("picco VRAM: %.2f GB" % (torch.cuda.max_memory_allocated() / 1024**3))

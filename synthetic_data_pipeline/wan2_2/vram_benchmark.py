@@ -29,7 +29,7 @@ OUTPUT_CSV = "outputs/vram_sweep.csv"
 # PRIMA del cudaMalloc che innescherebbe il fallback, quindi l'OOM diventa
 # reale e intercettabile dal try/except sotto. 0.90 lascia margine per il
 # contesto CUDA e altri processi che gia' occupano VRAM a riposo.
-torch.cuda.set_per_process_memory_fraction(0.90, device=0)
+#torch.cuda.set_per_process_memory_fraction(0.90, device=0)
 
 # Il VAE resta in fp32 (in bf16 produce artefatti di decodifica); transformer e
 # text encoder in bf16. Model cpu offload perche' i tre componenti insieme non
