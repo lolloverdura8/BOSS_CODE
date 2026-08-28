@@ -24,8 +24,14 @@ synthetic_data_pipeline/
 
 | Script | Cosa fa |
 |---|---|
-| `smoke_test.py` | Una singola generazione video completa (49 frame, 50 step) salvata in `outputs/smoke_test.mp4`. Serve a verificare che l'ambiente funzioni end-to-end. |
+| `smoke_test.py` | Una singola generazione video completa (49 frame, 50 step) salvata in `outputs/smoke_test.mp4`. Serve a verificare che l'ambiente funzioni end-to-end e a produrre un video ispezionabile a occhio. È **riproducibile**: usa lo stesso seed del benchmark, quindi due esecuzioni danno lo stesso video. |
 | `vram_benchmark.py` | Sweep di profilazione: misura memoria e tempo al variare del numero di frame generati, per stabilire dove sta il limite della macchina. Produce un CSV in `outputs/`. |
+
+I due script non sono indipendenti: condividono risoluzione, prompt, `GUIDANCE`, `FPS` e
+`SEED`, quindi il video a 49 frame dello smoke test è la controparte visiva della riga
+`num_frames=49` del CSV — stesso rumore iniziale, stessi parametri — e il picco VRAM che
+lo smoke test stampa è direttamente confrontabile con quella riga. Disallineare quei
+parametri fra i due script rende il confronto privo di senso.
 
 Il modello è `THUDM/CogVideoX-2b` in `float16` (il model card THUDM raccomanda fp16 per
 il 2b, a differenza del 5b che vuole bf16). Si è scelto il 2b dopo che il 5b si era
@@ -69,7 +75,8 @@ Windows: sono file di testo piccoli, l'overhead è trascurabile. La cache dei pe
 HuggingFace è anch'essa nativa, in `~/.cache/huggingface/hub/`.
 
 Ambiente verificato: Python 3.12, `torch 2.11.0+cu128`, `diffusers 0.40.0`, `psutil`,
-`sentencepiece`, `protobuf`. GPU: **RTX 5070 Ti, 16.3 GB VRAM**, esposta a WSL2 via
+`sentencepiece`, `protobuf`, `imageio 2.37.4` + `imageio-ffmpeg 0.6.0` (backend di
+scrittura video, vedi §4). GPU: **RTX 5070 Ti, 16.3 GB VRAM**, esposta a WSL2 via
 passthrough del driver Windows (nessun driver NVIDIA va installato dentro Ubuntu:
 lo romperebbe).
 
@@ -103,6 +110,22 @@ esegue la generazione. Tre dettagli che non sono opzionali:
   `torch.cuda.empty_cache()`. Togliere il riferimento non basta.
 - **Ordine**: `enable_model_cpu_offload()` va chiamato *dopo*, perché installa hook sui
   componenti registrati e deve trovare il text encoder già sparito.
+
+### Nota di correzione: cosa fa davvero `enable_slicing()`
+
+Il commento nel codice del benchmark (`# slicing: decodifica un frame per volta`) è
+impreciso, e la stessa imprecisione varrebbe per qualunque altro script della pipeline.
+Il sorgente del VAE (`autoencoder_kl_cogvideox.py`, `decode`) applica lo slicing solo se
+`z.shape[0] > 1`: **agisce sulla dimensione batch, non sui frame**. Con
+`num_videos_per_prompt=1` il latente in ingresso al decode ha batch 1, quindi in entrambi
+gli script la chiamata è **inerte** — i risparmi di memoria misurati non le sono
+attribuibili. Diventa attiva solo generando più video per prompt (vedi §4).
+
+Lo spezzettamento del decode lungo l'asse temporale esiste davvero, ma è un'altra cosa:
+`num_latent_frames_batch_size = 2`, sempre attivo e indipendente da slicing.
+
+Il tiling invece è realmente in funzione: la soglia è metà della risoluzione nativa
+(latente 30×45) e il nostro latente è 60×90.
 
 ### Perché driver/worker in subprocess
 
@@ -138,7 +161,89 @@ di una generazione reale a 50 step, scomponendolo in parte proporzionale agli st
 L'estrapolazione è stata validata contro misure reali a 50 step: errore fra 0% e 9%,
 tipicamente 1-3%.
 
-## 4. Dizionario delle colonne del CSV
+## 4. Architettura di `smoke_test.py`
+
+### A cosa serve e a cosa non serve
+
+Verifica end-to-end dell'ambiente e produzione di **un video da guardare**. Non è uno
+strumento di misura: le metriche che stampa servono a capire se il run è andato in modo
+sano, non a caratterizzare la macchina. Per quello c'è il benchmark.
+
+### Cosa condivide con il benchmark, e perché
+
+- **Precompute degli embedding con eliminazione di T5.** Stessa sequenza descritta in §3,
+  incluse le tre trappole (`torch.no_grad()`, rilascio in tre passi, ordine rispetto a
+  `enable_model_cpu_offload()`): non si ripete qui, vale identica. Nello smoke test la
+  motivazione principale però è diversa da quella del benchmark. `enable_model_cpu_offload()`
+  non elimina T5: lo **parcheggia in RAM di sistema** e lo risveglia sulla GPU quando serve.
+  Senza il precompute, quegli 8.87 GB restano occupati in RAM host per tutti i 50 step — e la
+  RAM host è il vincolo stretto di questa VM (15 GB), quello che ha ucciso il run originale
+  del benchmark. Il secondo effetto è sulla leggibilità del picco stampato: con T5 dentro la
+  pipeline il picco è ~10.8 GB ed è *lui*, non la generazione, quindi non confrontabile col
+  CSV. Non si aggira con un `reset_peak_memory_stats()` prima di `pipe()`, perché l'hook di
+  offload risveglia T5 sulla GPU *dentro* la chiamata.
+- **`SEED = 0`**, risoluzione, prompt, `GUIDANCE` e `FPS` allineati (§1).
+
+### Cosa NON condivide, e perché
+
+- **Niente struttura driver/worker.** Serve a sopravvivere al SIGKILL dell'OOM killer
+  quando ci sono altri punti da misurare dopo. Con una sola generazione non c'è nulla da
+  salvare: se il processo muore, quello *è* il risultato dello smoke test. In più il worker
+  comunica via JSON su stdout, contratto inutile qui dove il prodotto è un `.mp4`.
+- **Niente `SWEEP_STEPS` né estrapolazione.** Il benchmark gira a 3 step e stima i 50 per
+  misurare in fretta sei configurazioni; lo smoke test i 50 step li esegue davvero, perché
+  il suo prodotto è il video.
+- **Niente CSV né logica di raccomandazione** (`BUDGET_S`, `TARGET_S`): non c'è nessuno
+  sweep su cui scegliere.
+- **Niente metriche di RAM host** (`psutil`): servivano a seguire l'erosione della RAM punto
+  dopo punto in un processo che ne eseguiva sei di fila.
+
+### Come si legge l'output
+
+Tre metriche di VRAM, che dicono cose diverse:
+
+| Stampa | Cosa misura |
+|---|---|
+| `picco VRAM allocata` | Picco dei tensori effettivamente in uso dall'allocatore. **È il numero confrontabile con `vram_alloc_peak_gb_denoise` del CSV.** |
+| `picco VRAM prenotata` | Picco della VRAM prenotata al driver (≥ allocata: include la cache trattenuta per riuso). Il divario fra le due misura la frammentazione. |
+| `VRAM occupata sulla scheda` | Lettura istantanea del driver sull'intera GPU. |
+
+Se compare la riga `ATTENZIONE: sospetto sysmem fallback`, il tempo di generazione stampato
+va **scartato**, non interpretato: sotto WSL2 l'esaurimento di VRAM non dà un'eccezione ma
+uno swap silenzioso su RAM (§2), e il run continua centinaia di volte più lento.
+
+Stessa cautela già valida per il CSV: `VRAM occupata sulla scheda` è letta **dopo** il ritorno
+di `pipe()`, quindi dopo che `maybe_free_model_hooks()` ha scaricato i moduli dalla GPU, e
+sottostima il transiente del decode. Il dato affidabile è il picco allocato.
+
+### Backend di scrittura del video
+
+`export_to_video` sceglie il backend a runtime: con `imageio` + `imageio-ffmpeg` installati
+scrive in **H.264**; senza, ricade sul ramo OpenCV — marcato deprecato in diffusers — che
+scrive in `mp4v` (MPEG-4 Part 2), formato che diversi player e browser rifiutano. Se nel log
+compare `Support for the OpenCV backend will be deprecated`, i due pacchetti mancano nel
+venv. Nessun `ffmpeg` di sistema è richiesto: `imageio-ffmpeg` porta il proprio binario.
+480 e 720 sono entrambi divisibili per 16, quindi il `macro_block_size` di default non
+riscala l'immagine.
+
+### Generare più video da un solo prompt
+
+La leva è `num_videos_per_prompt` **nella chiamata a `encode_prompt`**, non l'omonimo
+parametro di `pipe()`: in `diffusers 0.40.0`, `CogVideoXPipeline.__call__` lo dichiara nella
+propria firma ma lo **riassegna a 1 incondizionatamente** prima di usarlo, quindi passarlo lì
+non ha effetto e non produce nessun errore né warning. Sul path con embedding precalcolati
+funziona invece correttamente, perché `__call__` ricava `batch_size` da
+`prompt_embeds.shape[0]`.
+
+Tre conseguenze da gestire quando lo si alzerà:
+
+1. `pipe(...).frames` conterrebbe N video, mentre lo script esporta `.frames[0]`: serve un
+   ciclo sull'export con nomi di file distinti;
+2. il costo del denoising scala circa ×N (i latenti sono N, 2N con CFG);
+3. `enable_slicing()` smette di essere inerte — è precisamente il caso per cui la chiamata
+   è tenuta in piedi (vedi la nota di correzione in §3).
+
+## 5. Dizionario delle colonne del CSV
 
 Ogni run scrive un file nuovo `outputs/vram_sweep_YYYYMMDD_HHMMSS.csv` (il codice
 precedente apriva il CSV in `"w"` e a ogni avvio cancellava i dati del run prima).
@@ -181,7 +286,7 @@ Valori di `fail_reason`:
 | `worker_error` | Il worker è uscito con un'eccezione Python (lo stderr viene stampato dal driver). |
 | `no_output` | Il worker è uscito con codice 0 ma non ha prodotto la riga JSON. Anomalia da indagare. |
 
-## 5. Come si leggono i risultati
+## 6. Come si leggono i risultati
 
 **Regola prima di tutte: guardare se le colonne di memoria variano con `num_frames`.**
 Se un valore è identico su punti diversi, quasi certamente non sta misurando ciò che si
@@ -224,7 +329,7 @@ griglia è percorribile**, incluso il punto nativo a 49 frame. Il picco VRAM si 
 GB su 16.3 disponibili, quindi la VRAM non è il vincolo su questa macchina — c'è più del
 doppio di margine. Il vincolo reale è la RAM host della VM WSL2.
 
-## 6. Parametri configurabili
+## 7. Parametri configurabili
 
 Tutti in testa a `vram_benchmark.py`.
 
@@ -241,3 +346,9 @@ Tutti in testa a `vram_benchmark.py`.
 
 `HEIGHT`/`WIDTH` (480×720) sono la risoluzione nativa del modello: cambiarli porta
 CogVideoX fuori distribuzione e i risultati non sono più rappresentativi.
+
+I parametri di `smoke_test.py` stanno anch'essi in testa al file: `HEIGHT`, `WIDTH`,
+`NUM_FRAMES`, `NUM_STEPS`, `GUIDANCE`, `FPS`, `SEED`. Sono **volutamente allineati** agli
+omonimi del benchmark, ed è ciò che rende il video prodotto la controparte visiva della riga
+`num_frames=49` del CSV e il picco VRAM stampato confrontabile con quella riga (§1).
+Modificarne uno solo dei due lati fa decadere il confronto senza che nulla lo segnali.
