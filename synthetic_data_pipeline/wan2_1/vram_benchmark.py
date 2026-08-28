@@ -1,13 +1,17 @@
 # vram_benchmark.py
 #
-# Sweep di profilazione memoria/tempo di Wan2.2-TI2V-5B al variare di num_frames.
+# Sweep di profilazione memoria/tempo di Wan2.1-T2V-1.3B al variare di num_frames.
 #
-# Struttura driver/worker (vedi run_driver / run_worker sotto): il driver lancia
-# un subprocess per ogni punto dello sweep, cosi' un punto che muore non porta con
-# se' tutti i punti successivi. Il run originale di questo script era monoprocesso
-# e infatti e' morto al primo punto (25 frame) lasciando il CSV con la sola
-# intestazione. Struttura e nomi delle colonne sono deliberatamente identici a
-# quelli di cogvideox/vram_benchmark.py: i due CSV vanno letti affiancati.
+# Perche' esiste questa cartella accanto a wan2_2/: Wan2.2-TI2V-5B richiede >=24 GB
+# di VRAM per model card e su questa scheda (16.3 GB) va in OOM vero prima di
+# raggiungere il proprio punto nativo. Wan2.1-T2V-1.3B e' il Wan piu' piccolo
+# disponibile (non esiste un Wan2.2 sotto i 5B) ed e' l'unico che su questo hardware
+# possa competere. In piu' il suo nativo, 832x480, sta a +15% di pixel per frame da
+# CogVideoX (480x720): e' il primo confronto a parita' di risoluzione, quindi il primo
+# in cui la differenza misurata e' attribuibile ai modelli e non ai loro punti operativi.
+#
+# Struttura driver/worker identica a quella di cogvideox/ e wan2_2/, cosi' come i nomi
+# delle colonne del CSV: i tre sweep vanno letti affiancati.
 import argparse
 import csv
 import gc
@@ -22,74 +26,68 @@ import psutil
 import torch
 from diffusers import AutoencoderKLWan, WanPipeline
 
-MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 
-# Risoluzione nativa del modello (720p, compressione VAE 16x16x4). Vincoli di
-# forma verificati sul sorgente: height e width devono essere multipli di
-# vae_scale_factor_spatial (16) x patch_size del transformer (2) = 32, altrimenti
-# pipeline_wan.py li arrotonda in silenzio con un warning. 704 e 1280 lo sono.
-HEIGHT, WIDTH = 704, 1280
+# Risoluzione nativa del modello: 480P, cioe' 832x480. Il 720p e' documentato come
+# "meno stabile" su questa taglia, quindi si resta al nativo.
+# Vincolo di forma: multipli di vae_scale_factor_spatial x patch_size del transformer.
+# ATTENZIONE, qui il fattore e' diverso da Wan2.2: il VAE di Wan2.1 comprime 8x sullo
+# spazio (non 16x), quindi il vincolo e' 8 x 2 = 16. 480 e 832 sono entrambi multipli.
+HEIGHT, WIDTH = 480, 832
 NUM_STEPS = 50    # step di riferimento (quelli di una generazione reale)
-GUIDANCE = 5.0    # default nativo Wan (CogVideoX usa 6.0: modelli diversi, il valore non si riusa)
-FPS = 24          # frame rate nativo: esportare piu' lento falsa il moto
+GUIDANCE = 5.0    # default della model card diffusers
+
+# Frame rate nativo. La model card diffusers del 1.3B esporta a fps=15, ma il repo
+# upstream Wan-Video/Wan2.1 usa 16: si segue l'upstream, perche' e' il frame rate di
+# addestramento ed esportare piu' lento falsa il moto. La discrepanza vale un 6% sulle
+# durate e non sposta nessuna conclusione, ma la scelta e' consapevole.
+FPS = 16
 
 # Lo sweep gira a pochi step invece dei 50 di riferimento: il picco di memoria si
 # raggiunge entro il primo step (gli step successivi riusano gli stessi buffer),
 # quindi 50 step moltiplicherebbero il wall time senza aggiungere informazione.
-# Da SWEEP_STEPS si ricava il tempo per step e si estrapola linearmente il tempo
-# che avrebbero richiesto NUM_STEPS step. Stesso valore usato per CogVideoX, dove
-# l'estrapolazione e' stata validata contro misure reali a 50 step (errore 0-9%).
+# Da SWEEP_STEPS si ricava il tempo per step e si estrapola linearmente il tempo che
+# avrebbero richiesto NUM_STEPS step. Stesso valore usato per gli altri due modelli,
+# dove l'estrapolazione e' stata validata contro misure reali a 50 step.
 SWEEP_STEPS = 3
 
-# Punti dello sweep: durata = num_frames / FPS, da ~1s al nativo (121 = 5.04s).
+# Punti dello sweep: durata = num_frames / FPS, da ~1s al nativo (81 = 5.06s).
 # Vincolo del VAE: num_frames deve essere 4k+1 (vae_scale_factor_temporal = 4),
 # altrimenti pipeline_wan.py arrotonda al valore valido piu' vicino con un warning.
-FRAME_POINTS = [25, 49, 73, 97, 121]
+# La griglia si ferma al nativo: oltre, il modello va fuori distribuzione.
+FRAME_POINTS = [17, 33, 49, 65, 81]
 
 BUDGET_S = 300   # obiettivo: 5 minuti per video
 TARGET_S = 2.0   # obiettivo: scenari da ~2s
 
-# Seed fisso: senza, due run dello stesso punto partono da rumore iniziale diverso
-# e tempi/picchi non sono rigorosamente confrontabili. Stesso valore dello smoke
-# test, cosi' il video a 121 frame e' la controparte visiva di quella riga del CSV.
+# Seed fisso: senza, due run dello stesso punto partono da rumore iniziale diverso e
+# tempi/picchi non sono rigorosamente confrontabili. Stesso valore dello smoke test e
+# degli altri due modelli.
 SEED = 0
 
-# Tetto imposto all'allocatore PyTorch, come frazione della VRAM fisica.
-#
-# Questa riga era gia' presente nel file, commentata. Va attivata qui e NON nel
-# benchmark di CogVideoX per una ragione di piattaforma: CogVideoX gira sotto WSL2,
-# dove il driver ignora "CUDA - Sysmem Fallback Policy" (microsoft/WSL#11050, chiusa
-# senza fix) e il tetto non impedirebbe comunque lo swap silenzioso su RAM. Wan gira
-# su Windows nativo, dove il driver la policy la rispetta: imponendo un tetto
-# esplicito, l'allocazione fallisce PRIMA del cudaMalloc che innescherebbe il
-# fallback, quindi l'OOM diventa reale e intercettabile dal try/except del worker.
-#
-# Serve qui e non serviva a CogVideoX anche per una ragione di scala: CogVideoX si
-# ferma a 7.44 GB su 16.3 disponibili, mentre il solo transformer di Wan pesa ~10 GB
-# su una scheda che ha gia' ~1.4 GB occupati dal desktop Windows a riposo. Il
-# soffitto e' vicino e va colpito in modo pulito, non attraversato in silenzio.
+# Tetto imposto all'allocatore PyTorch, come frazione della VRAM fisica. Stessa
+# ragione documentata per wan2_2: su Windows nativo il driver rispetta la Sysmem
+# Fallback Policy, quindi un tetto esplicito fa fallire l'allocazione PRIMA del
+# cudaMalloc che innescherebbe lo swap silenzioso su RAM, e l'OOM diventa un
+# OutOfMemoryError vero e intercettabile. Sotto WSL2 (dove gira CogVideoX) sarebbe
+# inutile, perche' li' il driver la policy la ignora.
 VRAM_FRACTION = 0.90
 
-# Soglia di RAM host sotto la quale il driver non tenta nemmeno il punto.
-# Alta rispetto ai 4.0 GB di CogVideoX perche' qui il caricamento della pipeline
-# completa e' un transiente da ~24 GB (text encoder UMT5-XXL bf16 11.36 + transformer
-# bf16 ~10 + VAE fp32 2.82) contro i ~12.4 GB di CogVideoX. E cambia anche il modo di
-# fallire: su Linux interveniva l'OOM killer con SIGKILL, su Windows non esiste, il
-# sistema spilla sul pagefile e il sintomo e' lentezza. La soglia serve a non tentare
-# punti destinati a thrashare.
-HOST_RAM_MIN_GB = 16.0
+# Soglia di RAM host sotto la quale il driver non tenta nemmeno il punto. Piu' bassa
+# dei 16.0 GB di wan2_2 perche' qui il caricamento della pipeline completa e' un
+# transiente da ~14.5 GB (text encoder UMT5-XXL 10.58 + transformer ~2.6 + VAE) contro
+# i ~22.5 GB del 5B. Su Windows non esiste l'OOM killer: il sistema spilla sul pagefile
+# e il sintomo e' lentezza, quindi la soglia serve a non tentare punti che thrasherebbero.
+HOST_RAM_MIN_GB = 12.0
 
-# Tetto per singolo punto. Piu' alto dei 600 s di CogVideoX perche' un punto Wan a
-# 3 step costa molto di piu' (27k token per step a 704x1280 contro i ~5k di
-# CogVideoX a 480x720, e il CFG di Wan esegue due forward sequenziali del
-# transformer per step), a cui si aggiunge il decode a tasselli di 121 frame.
-WORKER_TIMEOUT_S = 1800
+# Tetto per singolo punto. Meta' di quello di wan2_2: il transformer e' 1.3B invece di
+# 5B e i punti costano molto meno.
+WORKER_TIMEOUT_S = 900
 
-# Un file nuovo per ogni run invece di sovrascrivere: il codice precedente apriva
-# il CSV in "w", quindi ogni avvio cancellava i dati del run precedente.
+# Un file nuovo per ogni run invece di sovrascrivere.
 OUTPUT_CSV = "outputs/vram_sweep_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# Stesso prompt positivo di cogvideox/vram_benchmark.py, per confronto diretto.
+# Stesso prompt positivo di cogvideox/ e wan2_2/, per confronto diretto.
 prompt = (
     "POV shot from a person walking along a city sidewalk on a sunny afternoon, "
     "steady forward motion, parked cars lining the left side of the street, "
@@ -98,15 +96,16 @@ prompt = (
     "mass presence of trees, poles and suspended branches,"
 )
 
-# Negative prompt ufficiale del modello (in cinese nella model card): scoraggia
-# sovraesposizione, staticita', volti e arti deformi, sfondo affollato. CogVideoX
-# non ne ha uno ufficiale e usa None: la differenza e' voluta, ogni modello va
-# eseguito alla sua configurazione nativa.
+# Negative prompt ufficiale del modello. La card del 1.3B lo riporta in inglese, quella
+# di Wan2.2-TI2V-5B in cinese: sono la traduzione l'una dell'altra, stessa lista di
+# concetti, quindi la differenza non introduce una variabile di confronto. Si usa quello
+# della rispettiva card. CogVideoX non ha un negative prompt ufficiale e usa None.
 negative_prompt = (
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
-    "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
-    "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，"
-    "静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+    "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+    "paintings, images, static, overall gray, worst quality, low quality, JPEG "
+    "compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly "
+    "drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, "
+    "messy background, three legs, many people in the background, walking backwards"
 )
 
 # --- strumentazione della memoria -------------------------------------------
@@ -115,12 +114,10 @@ negative_prompt = (
 #   alloc_peak    : picco dei tensori effettivamente in uso dall'allocatore PyTorch
 #   reserved_peak : picco della VRAM che PyTorch ha prenotato al driver (>= alloc,
 #                   include la cache che trattiene per riuso)
-#   device_used   : VRAM occupata sulla scheda intera, vista dal driver (include
-#                   altri processi, desktop Windows compreso); e' una lettura
-#                   ISTANTANEA, non un picco
+#   device_used   : VRAM occupata sulla scheda intera, vista dal driver (include altri
+#                   processi, desktop Windows compreso); lettura ISTANTANEA, non un picco
 #   host_rss      : RAM di sistema occupata da questo processo
 #   host_avail    : RAM di sistema ancora libera
-# Le due misure host servono a distinguere un limite di VRAM da un limite di RAM.
 PROC = psutil.Process()
 
 MEM_FIELDS = (
@@ -167,13 +164,13 @@ def make_step_probe(total_steps, out):
 
 def estimate_full_run(elapsed, step_times, sweep_steps, target_steps):
     """Estrapola il tempo di una generazione a target_steps step da una misurata a
-    sweep_steps. Il tempo si scompone in una parte proporzionale agli step
-    (denoising) e una fissa (setup + decode VAE), che non va moltiplicata.
-    Gli intervalli fra step consecutivi escludono gia' il warm-up che precede il
-    primo step, quindi danno il costo marginale pulito di uno step. Attenzione in
-    lettura: uno step di Wan comprende DUE forward del transformer, condizionato e
-    non condizionato, eseguiti in sequenza (pipeline_wan.py li chiama separatamente
-    invece di impilarli in un batch 2N come fa CogVideoX)."""
+    sweep_steps. Il tempo si scompone in una parte proporzionale agli step (denoising)
+    e una fissa (setup + decode VAE), che non va moltiplicata. Gli intervalli fra step
+    consecutivi escludono gia' il warm-up che precede il primo step, quindi danno il
+    costo marginale pulito di uno step. Attenzione in lettura: uno step di Wan
+    comprende DUE forward del transformer, condizionato e non condizionato, eseguiti in
+    sequenza (pipeline_wan.py li chiama separatamente invece di impilarli in un batch
+    2N come fa CogVideoX)."""
     deltas = [b - a for a, b in zip(step_times, step_times[1:])]
     if not deltas or elapsed is None:
         return None, None
@@ -183,26 +180,21 @@ def estimate_full_run(elapsed, step_times, sweep_steps, target_steps):
 
 
 def sysmem_fallback_suspected(snap, vram_budget_gb):
-    """Un picco dell'allocatore che eguaglia il budget disponibile puo' essere
-    servito solo spillando su RAM di sistema. Con VRAM_FRACTION attiva il segnale
-    atteso e' l'OOM vero (colonna oom) e non questo, perche' l'allocatore rifiuta
-    prima di arrivarci; l'euristica resta come rete di sicurezza per le allocazioni
-    che NON passano dall'allocatore PyTorch (workspace di cuDNN/cuBLAS), che il
-    tetto non copre. Il confronto e' col budget effettivo e non con la capacita'
-    fisica della scheda: col tetto attivo alloc_peak non puo' piu' raggiungere il
-    98% del totale fisico, e l'euristica non scatterebbe mai.
-    Non si usa la differenza alloc_peak - device_used perche' quest'ultima diverge
-    anche in condizioni sane (alloc_peak e' un picco, device_used una lettura
-    istantanea presa a modelli gia' scaricati dalla GPU), quindi darebbe falsi
-    positivi."""
+    """Un picco dell'allocatore che eguaglia il budget disponibile puo' essere servito
+    solo spillando su RAM di sistema. Con VRAM_FRACTION attiva il segnale atteso e'
+    l'OOM vero (colonna oom) e non questo, perche' l'allocatore rifiuta prima di
+    arrivarci; l'euristica resta come rete di sicurezza per le allocazioni che NON
+    passano dall'allocatore PyTorch (workspace di cuDNN/cuBLAS), che il tetto non copre.
+    Il confronto e' col budget effettivo e non con la capacita' fisica della scheda:
+    col tetto attivo alloc_peak non puo' piu' raggiungere il 98% del totale fisico."""
     if snap is None:
         return False
     return snap["vram_alloc_peak_gb"] >= vram_budget_gb * 0.98
 
 
 def failed_result(num_frames, fail_reason):
-    """Riga per un punto che non ha prodotto misure: il worker e' morto, e' andato
-    in timeout, o non e' stato nemmeno tentato."""
+    """Riga per un punto che non ha prodotto misure: il worker e' morto, e' andato in
+    timeout, o non e' stato nemmeno tentato."""
     return {
         "num_frames": num_frames,
         "duration_s": num_frames / FPS,
@@ -246,22 +238,15 @@ def run_worker(num_frames):
     vram_budget_gb = vram_total_gb * VRAM_FRACTION
 
     # Il VAE resta in fp32 (in bf16 produce artefatti di decodifica); transformer e
-    # text encoder in bf16. I tre componenti insieme non stanno nei 16.3 GB della
-    # 5070 Ti, da qui il model cpu offload piu' sotto.
+    # text encoder in bf16.
     vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
     pipe = WanPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
 
-    # Peso dei tre componenti: parametri e occupazione dei soli pesi nel dtype con
-    # cui sono stati effettivamente caricati (escluse attivazioni e buffer
-    # temporanei). Serve a verificare quale componente domina il picco: un valore
-    # identico su punti diversi dello sweep non dipende da num_frames, quindi non
-    # appartiene alla parte che scala coi frame. E' l'errore che ha reso inutile il
-    # primo sweep di CogVideoX, dove il picco era il text encoder.
     # L'occupazione si somma parametro per parametro invece di moltiplicare per un
-    # dtype unico: dentro il transformer convivono due dtype, perche' diffusers
-    # tiene in fp32 i moduli elencati in _keep_in_fp32_modules anche quando la
-    # pipeline e' caricata in bf16. Leggere il dtype dal primo parametro darebbe
-    # un'etichetta sbagliata per l'intero modello.
+    # dtype unico: dentro il transformer convivono due dtype, perche' diffusers tiene
+    # in fp32 i moduli elencati in _keep_in_fp32_modules anche quando la pipeline e'
+    # caricata in bf16. Leggere il dtype dal primo parametro darebbe un'etichetta
+    # sbagliata per l'intero modello.
     for nome in ("text_encoder", "transformer", "vae"):
         m = getattr(pipe, nome)
         n = sum(p.numel() for p in m.parameters())
@@ -271,29 +256,28 @@ def run_worker(num_frames):
               % (nome, n / 1e9, b / 1024**3, "+".join(dtypes)),
               file=sys.stderr)
 
-    # Il text encoder UMT5-XXL (11.36 GB di soli pesi, quasi la meta' del modello)
-    # serve una volta sola e il suo risultato non dipende da num_frames: si calcolano
-    # gli embedding subito e poi lo si elimina, cosi' non pesa piu' sulla misura.
+    # Il text encoder UMT5-XXL (10.58 GB di soli pesi) e' lo STESSO di Wan2.2 ed e' qui
+    # il componente singolo piu' pesante, molto piu' del transformer da 1.3B. Serve una
+    # volta sola e il suo risultato non dipende da num_frames: si calcolano gli
+    # embedding subito e poi lo si elimina, cosi' non pesa piu' sulla misura.
     # Il transformer invece non si puo' eliminare allo stesso modo: viene invocato a
     # ogni step, due volte per step per via del CFG. Per lui la leva e'
-    # enable_model_cpu_offload, che lo tiene in RAM host e lo porta su GPU solo
-    # mentre serve, restituendo poi la VRAM al VAE per il decode.
+    # enable_model_cpu_offload, che lo tiene in RAM host e lo porta su GPU solo mentre
+    # serve, restituendo poi la VRAM al VAE per il decode.
     #
     # no_grad e' obbligatorio: solo pipe.__call__ e' decorato @torch.no_grad, mentre
-    # encode_prompt chiamato direttamente costruisce il grafo di autograd. Il grafo
-    # trattiene sia le attivazioni del text encoder sia i suoi pesi, rendendo
-    # inefficace il rilascio sotto (su CogVideoX questo errore lasciava 14.37 GB
-    # ancora occupati dopo il free, col picco sopra la capacita' della scheda).
+    # encode_prompt chiamato direttamente costruisce il grafo di autograd, che
+    # trattiene sia le attivazioni del text encoder sia i suoi pesi e rende inefficace
+    # il rilascio sotto.
     pipe.text_encoder.to("cuda")
     with torch.no_grad():
         prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=True,
-            # A differenza di CogVideoX, dove __call__ riassegna num_videos_per_prompt
-            # a 1 in silenzio e la leva vera e' solo questa, WanPipeline.__call__ lo
-            # onora davvero (lo passa a encode_prompt e a prepare_latents). Qui e li'
-            # sono equivalenti: alzarlo in un posto solo basta.
+            # WanPipeline.__call__ onora davvero num_videos_per_prompt (lo passa a
+            # encode_prompt e a prepare_latents), a differenza di CogVideoX dove viene
+            # riassegnato a 1 in silenzio: qui e li' sono equivalenti.
             num_videos_per_prompt=1,
             device=torch.device("cuda"),
             dtype=torch.bfloat16,
@@ -304,23 +288,22 @@ def run_worker(num_frames):
     # restituire al driver la VRAM che l'allocatore PyTorch teneva in cache
     # (empty_cache). enable_model_cpu_offload va chiamato DOPO: installa hook sui
     # componenti registrati e li sposta su CPU, quindi deve trovare il text encoder
-    # gia' sparito. Non serve toccare pipe.model_cpu_offload_seq: il loop di
-    # enable_model_cpu_offload salta i componenti che non sono piu' nn.Module.
+    # gia' sparito. Il suo loop salta i componenti che non sono piu' nn.Module.
     pipe.text_encoder = None
     gc.collect()
     torch.cuda.empty_cache()
 
     pipe.enable_model_cpu_offload()
-    # tiling: spezza ogni frame in riquadri, ed e' realmente attivo qui (la soglia e'
-    # 256 pixel / 16 di compressione = 16 in latente, e il nostro latente e' 44x80).
+    # tiling: spezza ogni frame in riquadri. La soglia e' 256 pixel / 8 di compressione
+    # spaziale = 32 in latente, e a 832x480 il latente e' 104x60: attivo.
+    # (In wan2_2 la stessa soglia dava 16, perche' li' la compressione e' 16x.)
     pipe.vae.enable_tiling()
     # slicing: spezza il decode lungo la dimensione BATCH, non lungo i frame. A
     # num_videos_per_prompt=1 il latente in ingresso al decode ha batch 1 e la riga e'
     # inerte, perche' il VAE la applica solo se z.shape[0] > 1; si tiene per parita'
-    # con smoke_test.py e col benchmark di CogVideoX, dove vale la stessa cosa. Da non
-    # confondere con lo spezzettamento temporale del decode, che nel VAE di Wan e'
-    # sempre attivo e piu' fine: decodifica un frame latente per volta tenendo lo
-    # stato nel feat_cache.
+    # con smoke_test.py e con gli altri due benchmark. Da non confondere con lo
+    # spezzettamento temporale del decode, che nel VAE di Wan e' sempre attivo e piu'
+    # fine: un frame latente per volta, con lo stato tenuto nel feat_cache.
     pipe.vae.enable_slicing()
 
     torch.cuda.empty_cache()
@@ -333,9 +316,8 @@ def run_worker(num_frames):
     t0 = time.time()
     try:
         frames = pipe(
-            # prompt e negative_prompt vanno a None: check_inputs solleva se si
-            # passano insieme alla loro versione precalcolata (CogVideoX su questo
-            # era piu' permissivo).
+            # prompt e negative_prompt vanno a None: check_inputs solleva se si passano
+            # insieme alla loro versione precalcolata.
             prompt=None,
             negative_prompt=None,
             prompt_embeds=prompt_embeds,
@@ -362,10 +344,10 @@ def run_worker(num_frames):
         else:
             raise
 
-    # Campione (b): la fase di decode e' gia' conclusa. Attenzione in lettura:
-    # qui device_used arriva DOPO che maybe_free_model_hooks ha scaricato i
-    # moduli dalla GPU, quindi sottostima il transiente del decode; per quella
-    # fase il dato affidabile e' vram_alloc_peak_gb, che e' un picco vero.
+    # Campione (b): la fase di decode e' gia' conclusa. Attenzione in lettura: qui
+    # device_used arriva DOPO che maybe_free_model_hooks ha scaricato i moduli dalla
+    # GPU, quindi sottostima il transiente del decode; per quella fase il dato
+    # affidabile e' vram_alloc_peak_gb, che e' un picco vero.
     samples["decode"] = mem_snapshot()
     s_per_step, est_full = estimate_full_run(
         elapsed, samples["step_times"], SWEEP_STEPS, NUM_STEPS
@@ -392,10 +374,9 @@ def run_worker(num_frames):
 def run_point_isolated(num_frames):
     """Lancia il worker in un processo separato e traduce l'esito in un risultato.
     returncode 0 = ok; positivo = il worker ha sollevato un'eccezione Python.
-    Il ramo negativo (terminato da segnale, per convenzione -N con -9 = SIGKILL
-    dell'OOM killer) e' quello che salvava lo sweep di CogVideoX sotto Linux: su
-    Windows non c'e' un OOM killer e resta di fatto irraggiungibile, si tiene per
-    simmetria fra i due script."""
+    Il ramo negativo (terminato da segnale, -9 = SIGKILL dell'OOM killer) e' quello che
+    salvava lo sweep di CogVideoX sotto Linux: su Windows non c'e' un OOM killer e resta
+    di fatto irraggiungibile, si tiene per simmetria fra gli script."""
     avail_gb = psutil.virtual_memory().available / 1024**3
     if avail_gb < HOST_RAM_MIN_GB:
         print("  RAM host disponibile %.2f GB < %.2f GB: punto non tentato"
@@ -519,7 +500,7 @@ def run_driver():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Sweep VRAM/tempo di Wan2.2-TI2V-5B al variare di num_frames.")
+        description="Sweep VRAM/tempo di Wan2.1-T2V-1.3B al variare di num_frames.")
     parser.add_argument("--worker", action="store_true",
                         help="esegue un solo punto e stampa una riga JSON"
                              " (uso interno del driver)")

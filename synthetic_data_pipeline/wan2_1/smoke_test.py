@@ -3,7 +3,11 @@
 # Generazione singola di verifica: produce un video guardabile per confermare che
 # l'ambiente funzioni end-to-end. Non e' uno strumento di misura (per quello c'e'
 # vram_benchmark.py), ma condivide con esso seed e parametri nativi, cosi' il video
-# a 73 frame e' la controparte visiva della riga frames=73 del CSV del benchmark.
+# a 81 frame e' la controparte visiva della riga frames=81 del CSV del benchmark.
+#
+# E' anche il video che rende finalmente confrontabile a occhio Wan contro CogVideoX:
+# 832x480 contro 480x720 sono +15% di pixel per frame, mentre Wan2.2 a 704x1280 ne
+# aveva 2.6x e la differenza visiva era dominata dalla risoluzione, non dal modello.
 import gc
 import os
 import time
@@ -12,50 +16,39 @@ import torch
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
 
-MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 
-# Risoluzione nativa del modello (720p, compressione VAE 16x16x4): generare
-# fuori da 704x1280 porta il modello fuori distribuzione e degrada la resa.
-# Vincolo di forma: multipli di vae_scale_factor_spatial (16) x patch_size del
-# transformer (2) = 32, altrimenti la pipeline arrotonda in silenzio.
-HEIGHT, WIDTH = 704, 1280
-# Durata = NUM_FRAMES / FPS. Vincolo del VAE: num_frames = 4k+1, per allinearsi
-# alla compressione temporale.
-#
-# Il nativo del modello sarebbe 121 frame (5.04 s), ma su questa scheda non e'
-# raggiungibile: lo sweep misura un OutOfMemoryError vero a 97 frame e a 121, con la
-# VRAM occupata sulla scheda gia' a 15.72 GB su 16.3 al punto 73. 73 frame (3.04 s)
-# e' quindi il punto piu' lungo che la 5070 Ti regge, ed e' quello scelto qui.
-#
-# NON e' il punto raccomandato dal benchmark, che indica 25 frame perche' e' l'unico
-# a stare nel budget di 300 s (73 frame costano ~589 s stimati). La scelta e'
-# deliberata e riguarda solo lo smoke test: il suo prodotto e' un video da giudicare
-# a occhio, e un clip da 1.04 s non permette di valutare la coerenza del moto in
-# avanti ne' la stabilita' degli ostacoli, che e' cio' che interessa a OR4. Per la
-# generazione in produzione vale la raccomandazione del CSV, non questo valore.
-NUM_FRAMES = 73
-NUM_STEPS = 50           # default del modello; sotto i 40 il denoising resta incompleto
-GUIDANCE = 5.0           # default nativo Wan (CogVideoX usa 6.0: modelli diversi, il valore non si riusa)
-FPS = 24                 # frame rate nativo: esportare piu' lento falsa il moto
+# Risoluzione nativa del modello: 480P, cioe' 832x480 (il 720p e' documentato come
+# "meno stabile" su questa taglia). Vincolo di forma: multipli di
+# vae_scale_factor_spatial (8, non 16 come in Wan2.2) x patch_size (2) = 16.
+HEIGHT, WIDTH = 480, 832
+# Durata = NUM_FRAMES / FPS: 81 frame = 5.06 s, il nativo del modello.
+# Vincolo del VAE: num_frames = 4k+1.
+NUM_FRAMES = 81
+NUM_STEPS = 50           # default del modello
+GUIDANCE = 5.0           # default della model card diffusers
+# Frame rate nativo. La card diffusers esporta a fps=15, il repo upstream
+# Wan-Video/Wan2.1 usa 16: si segue l'upstream, perche' e' il frame rate di
+# addestramento ed esportare piu' lento falsa il moto.
+FPS = 16
 
 # Seed fisso, stesso valore usato da vram_benchmark.py: senza generator il rumore
 # latente iniziale cambia a ogni run e due esecuzioni danno video diversi. Fissandolo
 # lo smoke test diventa riproducibile (un run andato storto si puo' rifare identico) e
-# confrontabile con il punto a 73 frame del benchmark, che parte dallo stesso rumore.
+# confrontabile con il punto a 81 frame del benchmark, che parte dallo stesso rumore.
 SEED = 0
 
-# Stesso tetto all'allocatore imposto dal benchmark, per la stessa ragione: su
-# Windows nativo il driver rispetta la Sysmem Fallback Policy, quindi un tetto
-# esplicito fa fallire l'allocazione PRIMA del cudaMalloc che innescherebbe lo
-# swap silenzioso su RAM, e si ottiene un OutOfMemoryError vero invece di un run
-# che continua centinaia di volte piu' lentamente. Tenerlo identico nei due script
-# e' anche cio' che rende confrontabile il picco stampato qui con la riga del CSV.
+# Stesso tetto all'allocatore imposto dal benchmark, per la stessa ragione: su Windows
+# nativo il driver rispetta la Sysmem Fallback Policy, quindi un tetto esplicito fa
+# fallire l'allocazione PRIMA del cudaMalloc che innescherebbe lo swap silenzioso su
+# RAM, e si ottiene un OutOfMemoryError vero invece di un run centinaia di volte piu'
+# lento. Tenerlo identico nei due script e' anche cio' che rende confrontabile il picco
+# stampato qui con la riga del CSV.
 VRAM_FRACTION = 0.90
 torch.cuda.set_per_process_memory_fraction(VRAM_FRACTION, device=0)
 
 # Il VAE resta in fp32 (in bf16 produce artefatti di decodifica); transformer e
-# text encoder in bf16. I tre componenti insieme non stanno nei 16.3 GB della
-# 5070 Ti, quindi cpu offload a livello di modello (piu' sotto).
+# text encoder in bf16.
 vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
 pipe = WanPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
 
@@ -68,23 +61,24 @@ prompt = (
     "mass presence of trees, poles and suspended branches,"
 )
 
-# Negative prompt ufficiale del modello (in cinese nella model card): scoraggia
-# sovraesposizione, staticita', volti e arti deformi, sfondo affollato.
+# Negative prompt ufficiale del modello. La card del 1.3B lo riporta in inglese, quella
+# di Wan2.2-TI2V-5B in cinese: sono la traduzione l'una dell'altra.
 negative_prompt = (
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
-    "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
-    "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，"
-    "静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+    "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+    "paintings, images, static, overall gray, worst quality, low quality, JPEG "
+    "compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly "
+    "drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, "
+    "messy background, three legs, many people in the background, walking backwards"
 )
 
-# Il text encoder UMT5-XXL (11.36 GB di soli pesi, quasi meta' del modello) serve una
+# Il text encoder UMT5-XXL (10.58 GB di soli pesi) e' lo STESSO di Wan2.2 ed e' qui il
+# componente singolo piu' pesante, quattro volte il transformer da 1.3B. Serve una
 # volta sola, all'inizio: si calcolano gli embedding subito e poi lo si elimina. Non e'
-# un dettaglio di misura ma di risorse: enable_model_cpu_offload() non elimina il text
-# encoder, lo parcheggia nella RAM di sistema e lo risveglia sulla GPU quando serve,
-# quindi senza questo blocco quegli 11.36 GB restano occupati in RAM host per tutti i
-# 50 step, sopra ai ~12.8 GB gia' richiesti da transformer e VAE. In piu' il picco VRAM
-# stampato a fine run resterebbe dominato dal text encoder invece di misurare la
-# generazione, e non sarebbe confrontabile col CSV.
+# un dettaglio di misura ma di risorse: enable_model_cpu_offload() non lo elimina, lo
+# parcheggia nella RAM di sistema e lo risveglia sulla GPU quando serve, quindi senza
+# questo blocco quei 10.58 GB restano occupati in RAM host per tutti i 50 step. In piu'
+# il picco VRAM stampato a fine run resterebbe dominato dal text encoder invece di
+# misurare la generazione, e non sarebbe confrontabile col CSV.
 # Il transformer non si puo' eliminare allo stesso modo: viene invocato a ogni step,
 # due volte per step per via del CFG. Per lui la leva e' l'offload, non il rilascio.
 # no_grad e' obbligatorio: solo pipe.__call__ e' decorato @torch.no_grad, mentre
@@ -96,11 +90,11 @@ with torch.no_grad():
         prompt=prompt,
         negative_prompt=negative_prompt,
         do_classifier_free_guidance=True,
-        # PER GENERARE PIU' VIDEO DALLO STESSO PROMPT si alza questo valore. A
-        # differenza di CogVideoX, dove l'omonimo parametro di pipe() viene
-        # riassegnato a 1 in silenzio e questa e' l'unica leva, WanPipeline.__call__
-        # lo onora davvero: i due punti sono equivalenti, basta alzarlo in uno.
-        # Due conseguenze da sistemare quando si alzera' N:
+        # PER GENERARE PIU' VIDEO DALLO STESSO PROMPT si alza questo valore.
+        # WanPipeline.__call__ onora davvero l'omonimo parametro (a differenza di
+        # CogVideoX, dove viene riassegnato a 1 in silenzio): i due punti sono
+        # equivalenti, basta alzarlo in uno. Due conseguenze da sistemare quando si
+        # alzera' N:
         #   - pipe(...).frames conterrebbe N video, mentre qui sotto si esporta
         #     .frames[0]: servirebbe un ciclo sull'export con nomi di file distinti;
         #   - enable_slicing() smette di essere inerte (vedi commento piu' sotto).
@@ -119,10 +113,8 @@ torch.cuda.empty_cache()
 # enable_model_cpu_offload va chiamato DOPO il blocco sopra: installa hook sui componenti
 # registrati e li sposta su CPU, quindi deve trovare il text encoder gia' sparito.
 pipe.enable_model_cpu_offload()
-# tiling: spezza ogni frame in riquadri, ed e' realmente attivo qui (la soglia e'
-# 256 pixel / 16 di compressione = 16 in latente, e il nostro latente e' 44x80).
-# A 704x1280 la decodifica a piena risoluzione e' il punto in cui tipicamente arriva
-# l'OOM.
+# tiling: spezza ogni frame in riquadri. La soglia e' 256 pixel / 8 di compressione
+# spaziale = 32 in latente, e a 832x480 il latente e' 104x60: realmente attivo.
 pipe.vae.enable_tiling()
 # slicing: spezza il decode lungo la dimensione BATCH. A num_videos_per_prompt=1 il
 # latente in ingresso al decode ha batch 1 e la riga e' inerte, perche' il VAE la applica
@@ -142,7 +134,7 @@ torch.cuda.reset_peak_memory_stats()
 t0 = time.time()
 frames = pipe(
     # prompt e negative_prompt vanno a None: check_inputs solleva se si passano
-    # insieme alla loro versione precalcolata (CogVideoX su questo era piu' permissivo).
+    # insieme alla loro versione precalcolata.
     prompt=None,
     negative_prompt=None,
     prompt_embeds=prompt_embeds,
@@ -158,7 +150,7 @@ elapsed = time.time() - t0
 
 # export_to_video sceglie il backend a runtime: con imageio + imageio-ffmpeg installati
 # scrive in H.264, altrimenti ricade sul ramo OpenCV (deprecato in diffusers) che scrive
-# in mp4v. 704 e 1280 sono entrambi divisibili per 16, quindi il macro_block_size di
+# in mp4v. 480 e 832 sono entrambi divisibili per 16, quindi il macro_block_size di
 # default non fa riscalare l'immagine.
 export_to_video(frames, "outputs/smoke_test.mp4", fps=FPS)
 
@@ -192,7 +184,6 @@ print("VRAM occupata sulla scheda: %.2f GB su %.2f GB" % (device_used_gb, vram_t
 # per le allocazioni che NON passano dall'allocatore PyTorch (workspace di cuDNN e
 # cuBLAS), che il tetto non copre. Il confronto e' col budget effettivo e non con la
 # capacita' fisica della scheda, altrimenti col tetto attivo non scatterebbe mai.
-# E' lo stesso criterio usato da vram_benchmark.py.
 if alloc_peak_gb >= vram_budget_gb * 0.98:
     print("ATTENZIONE: sospetto sysmem fallback (picco allocato >= 98%% del budget"
           " di %.2f GB). Il tempo di generazione sopra non e' rappresentativo."

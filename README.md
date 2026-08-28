@@ -7,12 +7,22 @@ del progetto B.O.S.S.
 
 ```
 synthetic_data_pipeline/
-├── cogvideox/          generazione video sintetici con CogVideoX-2b  ← documentato qui
-├── wan2_2/             generazione video sintetici con Wan2.2
+├── cogvideox/          CogVideoX-2b        480×720 @ 8 fps   ← documentato qui
+├── wan2_1/             Wan2.1-T2V-1.3B     832×480 @ 16 fps  ← documentato qui
+├── wan2_2/             Wan2.2-TI2V-5B      704×1280 @ 24 fps ← documentato qui, FUORI PORTATA HW
 ├── sam3_1/             segmentazione con SAM 3.1
 ├── depth_anything3/    stima di profondità con Depth Anything 3
 ├── cloud/  envs/  qa_export/
 ```
+
+I tre generatori video sono candidati **alternativi** per la stessa funzione. Il confronto che
+decide quale adottare è in fondo a questo documento.
+
+**Wan2.2-TI2V-5B è fuori portata su questa macchina**: la model card richiede ≥24 GB di VRAM
+contro i 16.3 della RTX 5070 Ti, e il nostro sweep lo conferma con `cuda_oom` prima del punto
+nativo. La sua cartella è conservata come record riproducibile e come punto di partenza per un
+test futuro su hardware adeguato, ma **i suoi pesi e il suo venv sono stati rimossi** e gli
+script non sono eseguibili qui — dettagli in §8 della sezione Wan2.2.
 
 
 
@@ -352,3 +362,500 @@ I parametri di `smoke_test.py` stanno anch'essi in testa al file: `HEIGHT`, `WID
 omonimi del benchmark, ed è ciò che rende il video prodotto la controparte visiva della riga
 `num_frames=49` del CSV e il picco VRAM stampato confrontabile con quella riga (§1).
 Modificarne uno solo dei due lati fa decadere il confronto senza che nulla lo segnali.
+
+---
+
+# Pipeline Wan2.2
+
+## 1. Scopo dei due script
+
+Gli stessi due ruoli della pipeline CogVideoX, con la stessa relazione fra loro:
+`smoke_test.py` produce **un video da guardare** (121 frame, 50 step, in
+`outputs/smoke_test.mp4`), `vram_benchmark.py` produce **un CSV di misure** al variare del
+numero di frame. Condividono risoluzione, prompt, `GUIDANCE`, `FPS` e `SEED`, quindi il video
+dello smoke test è la controparte visiva della riga `num_frames=121` del CSV — stesso rumore
+iniziale, stessi parametri.
+
+Il modello è `Wan-AI/Wan2.2-TI2V-5B-Diffusers`. I dtype non sono uniformi: **il VAE resta in
+`float32`** perché in bf16 produce artefatti di decodifica, transformer e text encoder sono in
+`bfloat16`.
+
+Peso dei tre componenti (misurato sommando parametro per parametro, non moltiplicando per un
+dtype unico — vedi nota sotto):
+
+| Componente | Parametri | Occupazione | dtype |
+|---|---|---|---|
+| `text_encoder` (UMT5-XXL) | 5.68 B | 10.58 GB | bf16 |
+| `transformer` | 5.00 B | 9.33 GB | bf16 + fp32 |
+| `vae` | 0.70 B | 2.63 GB | fp32 |
+
+Totale **~22.5 GB in RAM host** al caricamento della pipeline completa, contro i ~12.4 GB di
+CogVideoX.
+
+> **Perché il transformer ha due dtype.** Caricando la pipeline con `torch_dtype=bfloat16`,
+> `diffusers` tiene comunque in fp32 i moduli elencati in `_keep_in_fp32_modules` del modello.
+> Conseguenza pratica: leggere il dtype dal *primo* parametro (`next(m.parameters()).dtype`) dà
+> un'etichetta sbagliata per l'intero modello — riportava `float32` per un modello che pesa
+> 9.33 GB su 5.00 B di parametri, cioè 2 byte per parametro. Lo script somma
+> `p.numel() * p.element_size()` proprio per non incappare in questo.
+
+## 2. Ambiente di esecuzione
+
+**Si esegue su Windows nativo, NON sotto WSL2** — cioè l'esatto contrario di CogVideoX. Non è
+una scelta di comodo ma una conseguenza di come i due modelli tokenizzano il prompt:
+
+| | tokenizer in cache | dichiarato in `model_index.json` | Effetto di Smart App Control |
+|---|---|---|---|
+| CogVideoX-2b | solo `spiece.model` | `T5Tokenizer` (slow) | blocca `_sentencepiece` → **non parte** |
+| Wan2.2-TI2V-5B | `tokenizer.json` (16.8 MB) | `T5TokenizerFast` (Rust) | non passa da sentencepiece → **parte** |
+
+Il blocco che ha costretto CogVideoX a migrare sotto WSL2 (§2 della sezione precedente) colpisce
+l'estensione nativa di `sentencepiece`, necessaria a leggere `spiece.model`. Wan ha già il
+tokenizer serializzato in `tokenizer.json` e usa l'implementazione Rust: non tocca sentencepiece,
+che infatti **non è nemmeno installato** nel suo venv. Non è aggirabile dal lato CogVideoX:
+anche `T5TokenizerFast` dovrebbe *convertire* da `spiece.model`, quindi ripasserebbe da lì.
+
+Che i due modelli girino su piattaforme diverse è quindi una proprietà dei modelli su questa
+macchina, non un artefatto della configurazione — e pesa nel confronto finale.
+
+Comandi, dal terminale **PowerShell** integrato in VS Code:
+
+```powershell
+cd synthetic_data_pipeline\wan2_2
+.\.venv\Scripts\Activate.ps1
+python vram_benchmark.py        # sweep completo
+python smoke_test.py            # generazione singola di verifica
+```
+
+Ambiente verificato: venv locale `wan2_2\.venv`, Python 3.11.9, `torch 2.11.0+cu128`,
+`diffusers 0.40.0`, `transformers 5.15.1`, `accelerate 1.14.0`, `ftfy 6.3.1`, `psutil 7.2.2`,
+`imageio 2.37.4` + `imageio-ffmpeg 0.6.0`. Cache dei pesi in
+`C:\Users\pc\.cache\huggingface\hub\` (35 GB su disco per questo modello).
+GPU: **RTX 5070 Ti, 16.3 GB VRAM**, di cui **~1.4 GB già occupati dal desktop Windows a riposo**.
+RAM di sistema: 31.78 GB.
+
+> **`ftfy` non è opzionale qui.** `pipeline_wan.py` lo importa se disponibile e `prompt_clean` lo
+> usa per normalizzare il prompt. Un ambiente senza ftfy ripulisce il prompt diversamente e
+> produce embedding diversi: gli stessi parametri darebbero un video diverso.
+
+### Il tetto sull'allocatore, e perché qui serve
+
+`torch.cuda.set_per_process_memory_fraction(0.90, device=0)` è **attiva** in entrambi gli script
+Wan, mentre negli script CogVideoX resta commentata. La riga cappa la memoria che l'allocatore
+PyTorch può prenotare al driver, come frazione della VRAM fisica.
+
+La differenza sta nella piattaforma. Sotto WSL2 sarebbe inutile: il driver ignora "CUDA - Sysmem
+Fallback Policy" e il tetto non impedirebbe comunque lo swap su RAM. Su Windows nativo il driver
+la policy la rispetta, quindi con un tetto esplicito l'allocazione fallisce **prima** del
+`cudaMalloc` che innescherebbe il fallback: si ottiene un `torch.cuda.OutOfMemoryError` vero,
+intercettabile, e la colonna `oom` del CSV diventa un dato affidabile invece di una casella
+sempre falsa.
+
+Serve qui e non serviva a CogVideoX anche per una ragione di scala: CogVideoX si ferma a 7.44 GB
+su 16.3 disponibili, mentre il solo transformer di Wan pesa 9.33 GB su una scheda che ne ha già
+~1.4 occupati dal desktop. Il soffitto è vicino e va colpito in modo pulito, non attraversato in
+silenzio.
+
+**Conseguenza sulla lettura del CSV**: col tetto attivo `vram_alloc_peak_gb` non può più
+raggiungere il 98% della VRAM fisica, quindi la soglia di `sysmem_fallback_suspected` è rapportata
+al **budget effettivo** (`0.90 × 16.3 = 14.67 GB`) e non al totale della scheda. Senza questa
+correzione l'euristica non scatterebbe mai.
+
+## 3. Architettura di `vram_benchmark.py`
+
+È **la stessa architettura del benchmark CogVideoX**, deliberatamente: struttura driver/worker con
+un subprocess per punto, precompute degli embedding con eliminazione del text encoder prima di
+azzerare i contatori, probe su `callback_on_step_end` per separare la fase di denoising da quella
+di decode, cinque metriche di memoria × due fasi, `SWEEP_STEPS = 3` con estrapolazione a 50 step,
+CSV timestamped. Le motivazioni non si ripetono qui: valgono identiche, sono in §3 della sezione
+CogVideoX.
+
+Il motivo per cui la struttura è la stessa è che i due CSV vanno letti affiancati: stesse colonne,
+stessi nomi, stesso significato.
+
+### Perché il text encoder si elimina e il transformer no
+
+È la domanda naturale guardando i pesi: se il text encoder da 10.58 GB si può buttare, perché non
+il transformer da 9.33 GB, che pesa quasi uguale?
+
+Non è una questione di dimensione ma di **quante volte serve**. Il text encoder gira una volta
+sola all'inizio e il suo risultato — pochi MB di embedding — non dipende da `num_frames`: lo si
+usa e lo si elimina. Il transformer viene invocato a **ogni** step di denoising, 50 volte, e due
+volte per step per via del CFG: eliminarlo significherebbe ricaricare 9.33 GB cento volte. Per lui
+la leva non è il rilascio ma `enable_model_cpu_offload()`, che lo tiene in RAM host e lo sposta
+sulla GPU solo mentre serve, restituendo poi la VRAM al VAE per il decode.
+
+Timeline di memoria di un worker:
+
+| Momento | RAM host | VRAM |
+|---|---|---|
+| `from_pretrained` completo | ~22.5 GB (picco) | — |
+| encode del prompt | ~22.5 GB | 10.6 GB (text encoder) |
+| dopo il rilascio del text encoder | ~12 GB | ~0 |
+| denoising | ~12 GB | transformer + attivazioni |
+| decode VAE | ~13.5 GB (arriva l'array video) | VAE + tensore video |
+
+### Sei differenze rispetto a CogVideoX, verificate sul sorgente di `diffusers 0.40.0`
+
+Sono le trappole della pipeline CogVideoX ricontrollate una per una su `WanPipeline` e
+`AutoencoderKLWan`, che sono classi diverse. Tre valgono, tre no.
+
+1. **`num_videos_per_prompt` funziona davvero.** In CogVideoX `__call__` lo dichiara nella firma
+   ma lo riassegna a `1` in silenzio, e l'unica leva è l'omonimo parametro di `encode_prompt`.
+   `WanPipeline.__call__` invece lo onora: lo passa a `encode_prompt` e a `prepare_latents`. I due
+   punti sono equivalenti, basta alzarlo in uno.
+2. **`check_inputs` è più severo.** Solleva se si passano insieme `prompt` e `prompt_embeds`, o
+   `negative_prompt` e `negative_prompt_embeds`. Sul path con embedding precalcolati **entrambe le
+   stringhe vanno messe esplicitamente a `None`** — CogVideoX su questo era permissivo.
+3. **Il CFG esegue due forward sequenziali** del transformer, condizionato e non condizionato,
+   invece di impilarli in un batch 2N come CogVideoX. Il tempo per step raddoppia, la memoria no:
+   cambia come si legge `s_per_step`, non come si legge il picco.
+4. **`enable_slicing()` è inerte a batch 1, identico a CogVideoX.** Il VAE lo applica solo se
+   `z.shape[0] > 1`: agisce sulla dimensione batch, non sui frame. Si tiene per parità e perché
+   diventa attivo alzando `num_videos_per_prompt`.
+5. **Il decode del VAE Wan cicla già un frame latente per volta**, tenendo lo stato in un
+   `feat_cache`: è più fine dello spezzettamento temporale di CogVideoX
+   (`num_latent_frames_batch_size = 2`) e non dipende da nessuna chiamata. Il tiling invece è
+   realmente attivo e va abilitato: la soglia è 256 px / 16 di compressione = 16 in latente, e a
+   704×1280 il latente è 44×80.
+6. **Vincoli di forma.** `num_frames` deve essere `4k+1` (`scale_factor_temporal = 4`);
+   `height` e `width` devono essere multipli di `scale_factor_spatial (16) × patch_size (2) = 32`.
+   In entrambi i casi la pipeline **non solleva**: arrotonda al valore valido più vicino e stampa
+   un warning. 704, 1280 e i punti dello sweep rispettano già i vincoli.
+
+## 4. Architettura di `smoke_test.py`
+
+Stessa relazione col benchmark descritta in §4 della sezione CogVideoX, e stesse esclusioni:
+niente driver/worker, niente `SWEEP_STEPS` né estrapolazione (i 50 step li esegue davvero, perché
+il suo prodotto è il video), niente CSV né logica di raccomandazione, niente metriche di RAM host.
+
+Porta dal benchmark: precompute degli embedding con eliminazione del text encoder, `SEED = 0`,
+tetto sull'allocatore a `0.90` (tenerlo identico nei due script è ciò che rende confrontabile il
+picco stampato con la riga del CSV), `vae.enable_slicing()` per parità benché inerte, tre metriche
+VRAM + allarme sysmem fallback rapportato al budget.
+
+Due dettagli specifici di Wan:
+
+- **L'output è numpy, non PIL.** `WanPipeline` ha `output_type="np"` di default, quindi
+  `.frames[0]` è un array `(T, H, W, 3)` e la stampa usa `.shape` (CogVideoX restituisce una lista
+  di immagini PIL e usa `.size`). A 121 frame quell'array è ~1.3 GB in RAM host: è il salto di
+  `host_rss` che si vede fra la fase di denoising e quella di decode nel CSV.
+- **Backend video**: identico a CogVideoX (`imageio` + `imageio-ffmpeg` → H.264, altrimenti ramo
+  OpenCV deprecato → `mp4v`). 704 e 1280 sono divisibili per 16, quindi il `macro_block_size` di
+  default non riscala l'immagine.
+
+## 5. Dizionario delle colonne del CSV
+
+**Identico a quello della pipeline CogVideoX** (§5 sopra): stesse colonne, stessi nomi, stesso
+significato, stesso `fail_reason`. Due sole avvertenze specifiche di questa pipeline:
+
+| Colonna | Differenza |
+|---|---|
+| `sysmem_fallback_suspected` | La soglia è il 98% del **budget** `VRAM_FRACTION × VRAM fisica` (14.67 GB), non della VRAM fisica. Col tetto attivo il segnale atteso di esaurimento è `oom = True`; questa colonna resta come rete di sicurezza per le allocazioni che non passano dall'allocatore PyTorch (workspace di cuDNN e cuBLAS), che il tetto non copre. |
+| `fail_reason = killed_by_os` | Praticamente irraggiungibile su Windows, che non ha un OOM killer: il sistema spilla sul pagefile e il sintomo è lentezza, non un segnale. Il ramo resta nel codice per simmetria con lo script CogVideoX. Su questa piattaforma il segnale equivalente è `timeout`. |
+
+E una differenza di valore, non di significato: `HOST_RAM_MIN_GB` è **16.0** invece di 4.0, perché
+il caricamento della pipeline completa è un transiente da ~22.5 GB contro i ~12.4 di CogVideoX.
+
+> **Righe di un punto fallito.** Per un punto andato in OOM le colonne `_denoise` sono vuote (la
+> probe non è mai arrivata all'ultimo step) ma le `_decode` sono piene: `mem_snapshot()` viene
+> letto comunque dopo il `try`, quindi quei valori dicono **quanto in alto era arrivato
+> l'allocatore prima di fallire**. È informazione utile, non spazzatura: a 97 frame dice 13.48 GB
+> su un budget di 14.67.
+
+## 6. Come si leggono i risultati
+
+Valgono le stesse regole di lettura di §6 della sezione CogVideoX, a partire dalla prima: **le
+colonne di memoria devono variare con `num_frames`**. Qui variano, e in modo pulitamente lineare.
+
+### Risultati misurati (RTX 5070 Ti 16.3 GB, Wan2.2-TI2V-5B, 704×1280, `outputs/vram_sweep_20260828_135314.csv`)
+
+| frames | durata | s/step | tempo stimato a 50 step | VRAM alloc peak | VRAM device (denoise) | esito |
+|---|---|---|---|---|---|---|
+| 25 | 1.04 s | 2.51 s | 161.9 s | 10.53 GB | 12.71 GB | ok |
+| 49 | 2.04 s | 5.64 s | 348.4 s | 11.54 GB | 14.20 GB | ok, **oltre budget** |
+| 73 | 3.04 s | 10.08 s | 588.9 s | 12.55 GB | 15.72 GB | ok, **oltre budget** |
+| 97 | 4.04 s | — | — | (13.48 GB prima di fallire) | 15.09 GB | **`cuda_oom`** |
+| 121 | 5.04 s | — | — | (12.55 GB prima di fallire) | 14.37 GB | **`cuda_oom`** |
+
+Tre letture, in ordine di importanza:
+
+**1. Il punto nativo del modello non è raggiungibile su questa scheda.** Wan2.2-TI2V-5B è
+progettato per 121 frame (5.04 s) e va in OOM sia lì sia a 97. Il massimo effettivo è **73 frame,
+3.04 s**. E il margine a 73 è già finito: `vram_device_used_gb_denoise` è 15.72 GB su 16.3
+fisici, cioè 0.6 GB residui — di cui ~1.4 GB sono comunque il desktop Windows, quindi
+l'allocatore stava lavorando praticamente contro il muro.
+
+**2. L'OOM è un OOM vero, e questo valida il tetto sull'allocatore.** `sysmem_fallback_suspected`
+è `False` su tutta la griglia e `oom` è `True` sui due punti falliti: nessun punto ha "funzionato"
+degradando in silenzio a velocità inutilizzabile. È esattamente ciò per cui
+`set_per_process_memory_fraction` è stata attivata (§2), e la differenza rispetto a CogVideoX
+sotto WSL2 — dove lo stesso tetto non avrebbe potuto fare nulla — è netta. Alzare
+`VRAM_FRACTION` sposterebbe poco: a 73 frame la scheda è già occupata al 96%.
+
+> **Correzione di una diagnosi sbagliata, messa a verbale perché è controintuitiva.**
+> Durante l'esecuzione la macchina diventa pesantemente lenta e la VRAM risulta al 100%: la
+> conclusione naturale — e quella che è stata effettivamente tratta guardando — è che ci fosse un
+> fallback su RAM di sistema. **Non è così, e i dati lo escludono in due modi indipendenti:**
+> `sysmem_fallback_suspected` è `False` ovunque, e soprattutto lo smoke test a 73 frame girava a
+> ~10 s/step contro i **10.08 s/step** misurati dal benchmark allo stesso punto. Se ci fosse stato
+> spill su PCIe la differenza sarebbe di ordini di grandezza, non del 2‰.
+>
+> Quello che rallenta non è il modello: è **il resto del sistema**. A 73 frame restano 0.6 GB di
+> VRAM sui 16.3, e il desktop Windows — che a riposo ne usa ~1.4 — viene affamato. I 10 s/step
+> sono il costo genuino di 16.720 token attraverso un transformer da 5B con CFG, cioè due forward
+> per step. Wan2.2 su questa scheda non è *degradato*: è semplicemente *costoso*, ed è una
+> distinzione che cambia completamente quali rimedi abbiano senso (vedi §8).
+
+**3. Il costo per step cresce più che linearmente.** 2.51 → 5.64 → 10.08 s per step su
+25/49/73 frame, cioè +302% di tempo per +192% di token (6.160 → 16.720 token latenti). È la parte
+quadratica dell'attenzione sulla sequenza spazio-temporale: raddoppiare la durata del clip costa
+più del doppio, e questo peggiora la scalabilità di Wan più di quanto suggerisca il solo conteggio
+dei frame.
+
+**Un solo punto sta nel budget di 300 s: 25 frame, cioè 1.04 s di video.** Già a 49 frame (2.04 s)
+la stima è 348 s.
+
+## 7. Parametri configurabili
+
+Tutti in testa a `vram_benchmark.py`.
+
+| Parametro | Default | Note |
+|---|---|---|
+| `FRAME_POINTS` | `[25,49,73,97,121]` | Vincolo del VAE: solo valori `4k+1`. |
+| `SWEEP_STEPS` | `3` | Identico a CogVideoX. Costa tempo lineare. |
+| `NUM_STEPS` | `50` | Bersaglio dell'estrapolazione, non viene eseguito. Sotto i 40 il denoising di Wan resta incompleto. |
+| `GUIDANCE` | `5.0` | Default nativo di Wan. **Non** si riusa il 6.0 di CogVideoX: modelli diversi. |
+| `FPS` | `24` | Frame rate nativo. Esportare più lento falsa il moto. |
+| `SEED` | `0` | Identico a CogVideoX. |
+| `BUDGET_S` / `TARGET_S` | `300` / `2.0` | Identici a CogVideoX: sono i vincoli del progetto, non del modello. |
+| `VRAM_FRACTION` | `0.90` | Tetto sull'allocatore (§2). Abbassarlo per trovare il limite in modo più conservativo. |
+| `HOST_RAM_MIN_GB` | `16.0` | Il caricamento è un transiente da ~22.5 GB: sotto questa soglia il punto non si tenta. |
+| `WORKER_TIMEOUT_S` | `1800` | Il triplo di CogVideoX: un punto Wan costa molto di più. |
+
+`HEIGHT`/`WIDTH` (704×1280) sono la risoluzione nativa: Wan2.2-TI2V-5B è addestrato a 720p e
+generare fuori da lì lo porta fuori distribuzione.
+
+## 8. Esito: fuori portata su questo hardware
+
+**Wan2.2-TI2V-5B non è eseguibile al suo punto nativo su una RTX 5070 Ti da 16.3 GB.** La
+conclusione poggia su due prove indipendenti:
+
+- la **model card ufficiale** dichiara un requisito di **≥24 GB di VRAM** ("This command can run on
+  a GPU with at least 24GB VRAM, e.g. RTX 4090 GPU"), e raccomanda 80 GB per le prestazioni piene;
+- il nostro sweep trova il muro allo stesso posto in modo indipendente: `cuda_oom` a 97 e 121
+  frame, con la scheda già al 96% al punto 73.
+
+Non è aggirabile scendendo di taglia dentro la stessa famiglia: **un Wan2.2 più piccolo non
+esiste.** La famiglia è TI2V-5B — che è già il più piccolo — più T2V-A14B e I2V-A14B, modelli MoE
+da 27B parametri totali, cioè molto più grandi. Il Wan piccolo esiste ma appartiene alla
+generazione precedente: `Wan2.1-T2V-1.3B`, documentato più sotto in questo README.
+
+### Ottimizzazioni applicate
+
+Tutto quanto segue è **già attivo** negli script, e il muro a 73 frame è il risultato *dopo* averle
+applicate tutte:
+
+| Ottimizzazione | Perché / effetto |
+|---|---|
+| VAE in `float32`, transformer e text encoder in `bfloat16` | il bf16 sul VAE produce artefatti di decodifica; il resto in bf16 dimezza i pesi |
+| precompute degli embedding e rilascio del text encoder in tre passi, sotto `torch.no_grad()` | toglie **10.58 GB** dalla misura e dalla RAM host per tutta la generazione |
+| `enable_model_cpu_offload()` | transformer e VAE parcheggiati in RAM host, uno per volta sulla GPU |
+| `vae.enable_tiling()` | decode a tasselli: a 704×1280 la decodifica a piena risoluzione è il punto in cui tipicamente arriva l'OOM |
+| `vae.enable_slicing()` | **inerte a batch 1** (§3, differenza 4): tenuto per parità, non contribuisce |
+| `set_per_process_memory_fraction(0.90)` | converte il fallback silenzioso in `OutOfMemoryError` vero |
+| driver/worker in subprocess per punto | un punto che muore non porta via lo sweep |
+| `SWEEP_STEPS = 3` + estrapolazione | sweep completo in minuti invece che in ore |
+
+### Ottimizzazioni valutate e NON applicate, con il perché
+
+Sono elencate perché servono a chi rilancerà il test su hardware adeguato, e per non farle
+ripercorrere da zero:
+
+- **`enable_layerwise_casting(torch.float8_e4m3fn)`** — pesi in fp8, upcast a bf16 al momento del
+  calcolo. È già dentro diffusers, non richiede nessuna dipendenza nuova, e
+  `WanTransformer3DModel` dichiara esplicitamente `_skip_layerwise_casting_patterns`, quindi è un
+  percorso supportato per questo preciso modello. Porterebbe il transformer da 9.33 a ~4.8 GB e
+  **farebbe entrare i 121 frame**. Non applicata perché **non risolve il problema che conta**: la
+  VRAM non è ciò che decide il confronto con CogVideoX, lo è il tempo, e la quantizzazione dei
+  pesi non tocca il costo di calcolo. Sarebbe la prima cosa da provare se l'obiettivo fosse
+  ottenere il video nativo a scopo di ispezione visiva.
+- **`apply_group_offloading` con CUDA stream** — offload a livello di blocco sovrapposto al
+  calcolo, molto meno penalizzante dell'offload sequenziale. Stessa obiezione: sposta la VRAM, non
+  il tempo.
+- **Quantizzazione del transformer** — `diffusers 0.40.0` espone i backend bitsandbytes, gguf,
+  torchao, quanto, sdnq, nunchaku, autoround e modelopt, ma **nessuno è installato** nel venv.
+  Stessa obiezione delle due sopra, più un costo di dipendenze e una perdita di qualità da
+  quantificare.
+- **`enable_sequential_cpu_offload()`** — farebbe entrare il modello in pochi GB, ma trasferisce i
+  pesi layer per layer a ogni passaggio: con 30 layer × 50 step × 2 forward di CFG il traffico su
+  PCIe rende il tempo inaccettabile. È il rimedio giusto per un problema che qui non abbiamo.
+
+Il filo comune: **tutte e quattro attaccano la VRAM, e la VRAM non è il vincolo che decide.** Anche
+con memoria infinita il punto nativo di Wan2.2 resta ~19 minuti stimati contro i 157 s di CogVideoX
+per un clip più lungo (vedi la sezione di confronto).
+
+### Test futuri su hardware adeguato
+
+`wan2_2/vram_benchmark.py` è **conservato apposta** per essere rilanciato **invariato** su una
+macchina che rispetti i requisiti — RTX 4090, A100, H100 o una VM cloud equivalente. Tre cose da
+sapere prima di farlo:
+
+1. **I pesi sono stati rimossi da questa macchina** per liberare 34.29 GB. Un rilancio ne comporta
+   il riscaricamento.
+2. **Anche il venv `wan2_2/.venv` è stato rimosso**: su questa macchina gli script Wan2.2 non sono
+   più eseguibili. Le versioni da ricreare sono quelle elencate in §2, identiche a quelle del venv
+   di `wan2_1/`.
+3. **`FRAME_POINTS` va esteso oltre 121**: su una scheda adeguata il muro sarà altrove, e la
+   griglia attuale si fermerebbe prima di trovarlo. Anche `BUDGET_S` andrà riletto, perché lì il
+   tempo per punto sarà diverso.
+
+Rimangono su disco, come record riproducibile: `vram_benchmark.py`, `smoke_test.py` e
+`outputs/vram_sweep_20260828_135314.csv`.
+
+### Asse visivo: non valutato
+
+**Non esiste un `.mp4` di Wan2.2**, e la qualità visiva del modello su questo hardware resta non
+valutata. Lo smoke test a 73 frame è stato avviato ma interrotto a metà denoising: portava la VRAM
+al 96% e rendeva la macchina inusabile per i ~10 minuti della generazione, senza contropartita —
+perché il verdetto non dipendeva da quel video (§6 punto 1 e sezione di confronto). Il confronto
+visivo con CogVideoX viene fatto invece con **Wan2.1-T2V-1.3B**, che a 832×480 sta a +15% di pixel
+per frame da CogVideoX ed è quindi un paragone a parità di risoluzione, mentre Wan2.2 a 704×1280 ne
+aveva 2.6× e la differenza percepita sarebbe stata dominata dalla risoluzione, non dal modello.
+
+---
+
+# Confronto CogVideoX-2b vs Wan2.2-TI2V-5B
+
+Stesso hardware (RTX 5070 Ti 16.3 GB), stesso prompt, stesso `SEED`, stesso `NUM_STEPS = 50`,
+stesso budget di 300 s per video. Ogni modello alla **propria** risoluzione e al proprio frame
+rate nativi.
+
+Riferimenti: `cogvideox/outputs/vram_sweep_20260828_113340.csv` (più i due run precedenti, usati
+per la media) e `wan2_2/outputs/vram_sweep_20260828_135314.csv`.
+
+## 1. A parità di durata del clip
+
+| Durata target | CogVideoX (frame @ 8 fps) | Wan2.2 (frame @ 24 fps) | CogVideoX | Wan2.2 | rapporto |
+|---|---|---|---|---|---|
+| ~1 s | 9 | 25 | **24.7 s** | 161.9 s | 6.6× |
+| ~2 s | 17 | 49 | **41.7 s** | 348.4 s | 8.4× |
+| ~3 s | 25 | 73 | **63.9 s** | 588.9 s | 9.2× |
+| ~4 s | 33 | 97 | **89.6 s** | `cuda_oom` | — |
+| ~5 s | 41 | 121 | **124.5 s** | `cuda_oom` | — |
+| ~6 s | 49 | — | **156.8 s** | non raggiungibile | — |
+
+I tempi CogVideoX sono la media di tre sweep ripetuti; quelli Wan un solo sweep (vedi caveat 3).
+
+**Nel budget di 300 s**: CogVideoX percorre l'intera griglia fino al suo punto nativo da 6.13 s.
+Wan ha **un solo punto valido**, 25 frame = 1.04 s.
+
+## 2. A parità di pixel generati
+
+Qui il quadro si ribalta, ed è la lettura più interessante del confronto.
+
+| Modello | px/frame | punto | MP totali | s/MP |
+|---|---|---|---|---|
+| CogVideoX | 0.346 MP (480×720) | 9 → 49 frame | 3.11 → 16.93 | **7.9 → 9.3** |
+| Wan2.2 | 0.901 MP (704×1280) | 25 → 73 frame | 22.53 → 65.78 | **7.2 → 9.0** |
+
+**I due modelli costano lo stesso per pixel generato**, entro il rumore della misura. Il fattore
+7-9× della tabella precedente non è inefficienza di Wan: è interamente il prodotto di
+2.6× di risoluzione × 3× di frame rate = 7.8×, cioè esattamente il divario osservato.
+
+Detto altrimenti: a parità di secondi di calcolo i due modelli producono **la stessa quantità di
+pixel**. La domanda non è quale sia più veloce, ma **come conviene spendere quei pixel** — in
+risoluzione o in copertura temporale.
+
+## 3. VRAM e limite di lunghezza
+
+| | CogVideoX al nativo (49 frame) | Wan al massimo (73 frame) |
+|---|---|---|
+| picco allocato | 5.02 GB | 12.55 GB |
+| VRAM occupata sulla scheda | 7.44 / 16.3 GB | **15.72 / 16.3 GB** |
+| margine residuo | 8.9 GB | **0.6 GB** |
+| peso del transformer (costo fisso) | 3.15 GB | 9.33 GB |
+| costo marginale per frame | 0.029 GB | 0.042 GB |
+| raggiunge il proprio punto nativo? | **sì**, 49 frame / 6.13 s | **no**: OOM a 97 e 121 |
+
+Il costo marginale per **megapixel** è a favore di Wan (0.047 GB/MP contro 0.085), cioè le sue
+attivazioni sono più efficienti. Ma il costo fisso dei pesi è 3× e domina: è quello che porta la
+scheda al muro e impedisce a Wan di arrivare alla durata per cui è progettato.
+
+## 4. Costo di ambiente
+
+| | CogVideoX | Wan2.2 |
+|---|---|---|
+| piattaforma | **WSL2/Ubuntu obbligatorio** (SAC blocca il tokenizer su Windows) | Windows nativo |
+| GPU | virtualizzata via `/dev/dxg` | driver diretto |
+| RAM disponibile al processo | 15 GB (VM, default 50%) | 31.78 GB |
+| esaurimento VRAM | fallback silenzioso su RAM, rilevabile solo per euristica | **`OutOfMemoryError` vero** |
+| pesi su disco | 13 GB, duplicati nel filesystem Linux | 35 GB, cache Windows |
+| RAM host al caricamento | ~12.4 GB | ~22.5 GB |
+
+Non è una nota a piè di pagina: la VM da 15 GB è il vincolo che ha ucciso il primo sweep di
+CogVideoX, e l'impossibilità di ottenere un OOM affidabile è ciò che ha reso necessaria
+l'euristica `sysmem_fallback_suspected`. Per contro, i 22.5 GB di picco al caricamento di Wan
+richiedono una macchina con ≥32 GB di RAM.
+
+## 5. Tre caveat, prima del verdetto
+
+1. **Punti nativi diversi.** Il confronto risponde a "quale modello è migliore in ciò per cui è
+   progettato", non a "quale è più veloce a parità di pixel" — quest'ultima domanda ha risposta
+   nella §2, ed è "pari". Forzare Wan a 480×720 lo porterebbe fuori distribuzione e non
+   risponderebbe a nulla di utile.
+2. **Piattaforme diverse.** Una parte del divario di tempo è overhead di WSL2 e non del modello.
+   L'effetto però è limitato dai numeri stessi: se WSL2 penalizzasse CogVideoX in modo
+   significativo, il suo costo per megapixel risulterebbe **peggiore** di quello di Wan, e invece
+   i due coincidono entro il 5%. L'overhead di piattaforma è quindi dentro il rumore del metodo —
+   non azzerato, ma non tale da spostare le conclusioni.
+3. **Variabilità dell'estrapolazione.** La stima a 50 step parte da 3 step misurati. Sui tre sweep
+   ripetuti di CogVideoX la VRAM è risultata identica al centesimo di GB, ma i tempi variano fino
+   al **27%** ai punti alti (41 frame: 112–143 s). Differenze di tempo sotto il ~25% ai punti
+   lunghi **non sono risolvibili** con questo metodo. Le differenze qui in gioco sono di 6-9×,
+   quindi il verdetto regge; ma non si usino questi numeri per distinzioni fini.
+
+## 6. Verdetto
+
+**Per la generazione di dati sintetici OR4, CogVideoX-2b.** Le ragioni, in ordine:
+
+1. **Copertura temporale per unità di calcolo.** A parità di secondi di GPU, CogVideoX produce
+   ~2.5× più frame e ~2× più secondi di scena. Per un dataset conta la varietà di situazioni
+   viste, non la fluidità: i frame di Wan a 24 fps sono in larga parte quasi-duplicati del
+   precedente, quelli di CogVideoX a 8 fps sono temporalmente più distanti e quindi più
+   informativi per frame.
+2. **Solo CogVideoX sta nel budget.** Con 300 s per video, CogVideoX percorre tutta la griglia
+   fino a 6.13 s; Wan si ferma a 1.04 s. Per generare un dataset, questa è la differenza fra
+   fattibile e non fattibile.
+3. **Wan non raggiunge il proprio punto nativo su questa scheda.** OOM a 97 e 121 frame, e a
+   73 frame lavora con 0.6 GB di margine. È già un modello sotto stress su questo hardware,
+   mentre CogVideoX chiude il suo punto nativo con 8.9 GB liberi — cioè ha spazio per crescere
+   (batch multipli, risoluzioni maggiori, `num_videos_per_prompt > 1`).
+4. **Il vantaggio di risoluzione di Wan è in larga parte sprecato per OR4.** 704×1280 contro
+   480×720 aiuterebbe sugli ostacoli sottili (pali, rami sospesi), ma il target di deployment è
+   una classe Jetson con input tipicamente ≤ 640 px: già 480×720 è sopra ciò che il modello
+   schierato vedrà.
+
+Contro CogVideoX pesa il **costo di ambiente**: richiede WSL2, con GPU virtualizzata, VM da 15 GB
+e nessun OOM affidabile. È un costo reale, ma è già stato pagato e documentato, e non scala col
+numero di video generati.
+
+### L'asse visivo, e perché non si chiude qui
+
+I punti 1-3 sono chiusi dai numeri. Il punto 4 no: dipende da **come i due modelli rendono davvero
+gli ostacoli sottili**, ed è una cosa che si giudica guardando, non misurando.
+
+**Su questo confronto quell'asse resta aperto, e non verrà chiuso.** Non esiste un `.mp4` di
+Wan2.2 (§8): lo smoke test è stato interrotto perché rendeva la macchina inusabile per ~10 minuti
+senza contropartita decisionale. Ma anche se esistesse, sarebbe un confronto viziato: 704×1280
+contro 480×720 sono 2.6× di pixel per frame, quindi qualunque differenza percepita di nitidezza
+sugli ostacoli sottili sarebbe attribuibile alla risoluzione prima che al modello.
+
+Il confronto visivo si fa invece con **Wan2.1-T2V-1.3B**, che a 832×480 sta a +15% di pixel da
+CogVideoX — vedi la sezione di confronto a tre in fondo a questo documento. Lì i criteri sono:
+resa di pali, alberi e rami sospesi; coerenza del moto POV in avanti; stabilità geometrica della
+scena fra frame consecutivi.
+
+Resta valido il vincolo economico che qualunque esito visivo dovrebbe superare per ribaltare il
+verdetto su Wan2.2: 9× di costo per la stessa durata di clip, un tetto di 3 s contro i 6.13 s di
+CogVideoX, e una scheda da ≥24 GB che qui non c'è.
