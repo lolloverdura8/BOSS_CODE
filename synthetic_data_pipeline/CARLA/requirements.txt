@@ -1,0 +1,15 @@
+# Ambiente CARLA - Python 3.11 (py -3.11 -m venv .venv)
+#
+# carla 0.9.16: linea UE4 stabile, e' la "release impacchettata" del par. 5.0 del
+# piano. E' anche l'unica versione con wheel cp311 su Windows: la 0.9.15 si ferma
+# a cp310 e non e' installabile su questa macchina.
+carla==0.9.16
+# numpy < 2 obbligatorio: la PythonAPI di CARLA e' un'estensione boost::python
+# compilata contro l'ABI numpy 1.x. Stesso pin gia' in uso in sam3_1 e
+# depth_anything3, quindi l'allineamento e' anche di repository.
+numpy==1.26.4
+# opencv e non Pillow per scrivere la depth: cv2.imwrite su un array uint16
+# monocanale produce un PNG 16-bit grayscale in modo deterministico, mentre il
+# percorso PIL mode='I;16' e' proprio il downcast silenzioso a 8 bit che il
+# requisito R4 dell'appendice vuole prevenire.
+opencv-python==4.11.0.86

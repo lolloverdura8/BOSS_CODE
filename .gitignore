@@ -15,3 +15,5 @@ __pycache__/
 synthetic_data_pipeline/depth_anything3/Depth-Anything-3/
 synthetic_data_pipeline/sam3_1/sam3/
 test_images/
+PIANO_Dati_Sintetici_OR4.1.MD
+**/CARLA/outputs/
