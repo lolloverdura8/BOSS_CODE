@@ -69,8 +69,8 @@ corrispondente del CSV.
 - **`wan2_1/`** — Wan2.1-T2V-1.3B, 832×480.
 - **`wan2_2/`** — Wan2.2-TI2V-5B, 704×1280. Il modello eccede la VRAM disponibile su
   questa workstation: la cartella è conservata come record riproducibile e come punto di
-  partenza per un test su hardware adeguato, ma pesi e venv sono stati rimossi e gli
-  script non sono eseguibili qui.
+  partenza per un test su hardware adeguato. Pesi (~35 GB nella cache HuggingFace) e venv
+  (~4,7 GB) sono ancora sul disco e vanno rimossi quando servirà spazio.
 
 ### sam3_1/ · depth_anything3/
 
