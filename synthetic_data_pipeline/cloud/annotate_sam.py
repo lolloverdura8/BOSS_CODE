@@ -1,6 +1,6 @@
-# eval_on_generated.py
+# annotate_sam.py
 #
-# Passo 0.2 esteso: SAM 3 sui frame generati da wan2_2/generate_test_clips.py.
+# SAM 3 sui frame generati da cloud/runner.py.
 #
 # Qui non c'e' ground truth: il generatore inventa la scena e nessuno dice dove
 # sta l'oggetto. Non si calcola quindi uno IoU ma il TASSO DI INDIVIDUAZIONE per
@@ -10,21 +10,23 @@
 # CARLA.
 #
 # Per gli ostacoli sospesi si cerca anche il SUPPORTO (tronco, palo): la sua
-# maschera serve a depth_anything3/eval_on_generated.py per il controllo di
+# maschera serve ad annotate_da3.py per il controllo di
 # coerenza della profondita'. Maschere (.npz), overlay per la revisione a occhio e
-# CSV finiscono in outputs/generated_eval/.
+# CSV finiscono in --out-dir.
 import argparse
 import csv
 import glob
 import json
 import os
-import subprocess
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 
-# Stessa ragione di smoke_test.py: il clone in sam3\ farebbe ombra al package.
+# gpu.py sta in questa stessa cartella, quindi va importato PRIMA della riga sotto.
+import gpu
+
+# Stessa ragione di smoke_test.py: un clone in sam3\ farebbe ombra al package.
 sys.path = [p for p in sys.path if os.path.abspath(p or ".") != os.path.dirname(os.path.abspath(__file__))]
 
 import numpy as np
@@ -38,13 +40,14 @@ from sam3.model.sam3_image_processor import Sam3Processor  # noqa: E402
 VERSION = "sam3"
 DTYPE = torch.float16
 
-VRAM_BUDGET_GB = 13.0
-TEMP_LIMIT_C = 83
 TELEMETRY_EVERY = 10
-# Sotto questa VRAM libera prima di caricare, la scheda e' ancora occupata da
-# qualcun altro - tipicamente la generazione Wan non ancora chiusa. SAM ha un
-# picco misurato di 4,35 GB (B.1): 6 GB lasciano margine senza falsi allarmi.
-VRAM_FREE_MIN_GB = 6.0
+
+# Soglie di memoria e temperatura: riempite in main() dalla CLI, con i default di
+# gpu.py ricavati dalla scheda presente. Prima erano cablate a 13,0 e 6,0 GB,
+# tarate sui 16 GB della 5070 Ti: su un'altra scheda fermavano il run sbagliando.
+VRAM_BUDGET_GB = None
+VRAM_FREE_MIN_GB = None
+TEMP_LIMIT_C = None
 
 # classe BOSS -> (prompt oggetto, prompt supporto o None). Il supporto esiste solo
 # per i sospesi, ed e' la cosa a cui l'oggetto e' fissato nei prompt di generazione.
@@ -63,7 +66,8 @@ OVERLAY_ALPHA = 0.45
 COLOR_OBJ = (255, 0, 0)
 COLOR_SUP = (0, 90, 255)
 
-OUT_DIR = os.path.join("outputs", "generated_eval")
+# Riempita in main() da --out-dir.
+OUT_DIR = None
 
 
 def report_checkpoint_coverage(model, checkpoint_path):
@@ -81,30 +85,6 @@ def report_checkpoint_coverage(model, checkpoint_path):
     print("chiavi coperte:    %d su %d (%.1f%%)" % (covered, len(sd), 100.0 * covered / len(sd)))
     del raw, detector
     return len(missing), len(mismatched)
-
-
-def gpu_telemetry():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi",
-             "--query-gpu=temperature.gpu,clocks_throttle_reasons.active,clocks.current.sm",
-             "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL, text=True, timeout=10).strip().splitlines()[0]
-        temp, throttle, sm = [p.strip() for p in out.split(",")]
-        return {"gpu_temp_c": int(temp), "throttle_mask": throttle, "sm_clock_mhz": int(sm)}
-    except Exception:
-        return {"gpu_temp_c": None, "throttle_mask": None, "sm_clock_mhz": None}
-
-
-def is_throttling(tel):
-    if tel["throttle_mask"] is None:
-        return False
-    try:
-        mask = int(tel["throttle_mask"], 16)
-    except ValueError:
-        return False
-    hot = tel["gpu_temp_c"] is not None and tel["gpu_temp_c"] >= TEMP_LIMIT_C
-    return mask != 0 or hot
 
 
 def to_numpy_masks(output):
@@ -149,7 +129,7 @@ def best_detection(output):
 def load_clips(clips_dir):
     path = os.path.join(clips_dir, "manifest.jsonl")
     if not os.path.exists(path):
-        sys.exit("manifest non trovato: %s. Prima wan2_2/generate_test_clips.py." % path)
+        sys.exit("manifest non trovato: %s. Prima cloud/runner.py." % path)
     records = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -188,11 +168,7 @@ def evaluate(clips_dir, limit):
     if not clips:
         sys.exit("nessuna clip con frame in %s" % clips_dir)
 
-    free, total = torch.cuda.mem_get_info()
-    print("VRAM libera prima di caricare: %.2f GB su %.2f" % (free / 1e9, total / 1e9))
-    if free / 1e9 < VRAM_FREE_MIN_GB:
-        sys.exit("VRAM libera %.2f GB < %.1f GB: la scheda e' ancora occupata (Wan in"
-                 " corso?)." % (free / 1e9, VRAM_FREE_MIN_GB))
+    gpu.check_vram_free(VRAM_FREE_MIN_GB)
 
     model, checkpoint_path, precision_mode = build_model()
     n_missing, n_mismatched = report_checkpoint_coverage(model, checkpoint_path)
@@ -279,8 +255,8 @@ def evaluate(clips_dir, limit):
                          " il run si ferma invece di proseguire in sysmem fallback."
                          % (peak, VRAM_BUDGET_GB, n))
             if n % TELEMETRY_EVERY == 0:
-                tel = gpu_telemetry()
-                if is_throttling(tel):
+                tel = gpu.gpu_telemetry()
+                if gpu.is_throttling(tel, TEMP_LIMIT_C):
                     contaminated += 1
                     print("  frame %d: throttling (temp=%s, mask=%s)"
                           % (n, tel["gpu_temp_c"], tel["throttle_mask"]), file=sys.stderr)
@@ -317,9 +293,27 @@ def summarize(rows):
 def main():
     parser = argparse.ArgumentParser(
         description="SAM 3 sui frame generati da Wan (passo 0.2 esteso).")
-    parser.add_argument("--clips-dir", default=os.path.join("..", "wan2_2", "outputs", "test_clips"))
+    parser.add_argument("--clips-dir", default=os.path.join("..", "wan2_2", "outputs", "test_clips"),
+                        help="cartella con manifest.jsonl e frames/; sul pod /workspace/out/<modello>")
+    parser.add_argument("--out-dir", default=os.path.join("outputs", "generated_eval"),
+                        help="dove finiscono maschere, overlay e CSV")
     parser.add_argument("--limit", type=int, default=None, help="solo le prime N clip")
+    parser.add_argument("--vram-budget-gb", type=float, default=None,
+                        help="stop se il picco supera questa soglia (default: frazione %.2f"
+                             " della VRAM della scheda)" % gpu.VRAM_BUDGET_FRACTION)
+    parser.add_argument("--vram-free-min-gb", type=float, default=gpu.VRAM_FREE_MIN_GB)
+    parser.add_argument("--temp-limit-c", type=int, default=gpu.TEMP_LIMIT_C,
+                        help="sopra questa temperatura la misura e' marcata contaminata")
     args = parser.parse_args()
+
+    global OUT_DIR, VRAM_BUDGET_GB, VRAM_FREE_MIN_GB, TEMP_LIMIT_C
+    OUT_DIR = args.out_dir
+    VRAM_FREE_MIN_GB = args.vram_free_min_gb
+    TEMP_LIMIT_C = args.temp_limit_c
+    VRAM_BUDGET_GB = args.vram_budget_gb or gpu.vram_budget_gb()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print("soglie: picco max %.1f GB, libera minima %.1f GB, temperatura %d C"
+          % (VRAM_BUDGET_GB, VRAM_FREE_MIN_GB, TEMP_LIMIT_C))
 
     rows, elapsed, peak, contaminated, non_finite, precision_mode = evaluate(
         args.clips_dir, args.limit)

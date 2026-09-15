@@ -1,7 +1,7 @@
-# eval_on_generated.py
+# annotate_da3.py
 #
-# Passo 0.2 esteso: Depth Anything 3 sui frame generati da wan2_2, con le maschere
-# prodotte da sam3_1/eval_on_generated.py.
+# Depth Anything 3 sui frame generati da cloud/runner.py, con le maschere
+# prodotte da annotate_sam.py.
 #
 # Qui non c'e' ground truth di profondita', quindi niente AbsRel ne' delta<1,25
 # contro un riferimento. Si misura una COERENZA INTERNA che non dipende dalla
@@ -24,7 +24,6 @@ import csv
 import gc
 import glob
 import os
-import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -40,15 +39,19 @@ torch.cuda.is_bf16_supported = lambda *a, **k: False
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.utils.visualize import visualize_depth  # noqa: E402
 
+import gpu  # noqa: E402
+
 DEFAULT_MODEL = "depth-anything/DA3-BASE"
 DEFAULT_PROCESS_RES = 1008
 
-VRAM_BUDGET_GB = 13.0
-TEMP_LIMIT_C = 83
 TELEMETRY_EVERY = 10
-# DA3-BASE ha un picco misurato di 1,49 GB (B.2): sotto 6 GB liberi la scheda e'
-# ancora occupata da qualcun altro.
-VRAM_FREE_MIN_GB = 6.0
+
+# Soglie di memoria e temperatura: riempite in main() dalla CLI, con i default di
+# gpu.py ricavati dalla scheda presente. Prima erano cablate a 13,0 e 6,0 GB,
+# tarate sui 16 GB della 5070 Ti: su un'altra scheda fermavano il run sbagliando.
+VRAM_BUDGET_GB = None
+VRAM_FREE_MIN_GB = None
+TEMP_LIMIT_C = None
 
 DELTA_THRESHOLD = 1.25
 # Fascia di suolo sotto il box del monopattino, in pixel su 704 di altezza.
@@ -63,32 +66,8 @@ CLASS_ORDER = ("monopattino",) + SUSPENDED
 COLOR_OBJ = np.array((255, 0, 0), np.uint8)
 COLOR_REF = np.array((0, 90, 255), np.uint8)
 
-OUT_DIR = os.path.join("outputs", "generated_eval")
-
-
-def gpu_telemetry():
-    """Temperatura, throttling e clock, da nvidia-smi. Vuoto se non disponibile."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi",
-             "--query-gpu=temperature.gpu,clocks_throttle_reasons.active,clocks.current.sm",
-             "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL, text=True, timeout=10).strip().splitlines()[0]
-        temp, throttle, sm = [p.strip() for p in out.split(",")]
-        return {"gpu_temp_c": int(temp), "throttle_mask": throttle, "sm_clock_mhz": int(sm)}
-    except Exception:
-        return {"gpu_temp_c": None, "throttle_mask": None, "sm_clock_mhz": None}
-
-
-def is_throttling(tel):
-    if tel["throttle_mask"] is None:
-        return False
-    try:
-        mask = int(tel["throttle_mask"], 16)
-    except ValueError:
-        return False
-    hot = tel["gpu_temp_c"] is not None and tel["gpu_temp_c"] >= TEMP_LIMIT_C
-    return mask != 0 or hot
+# Riempita in main() da --out-dir.
+OUT_DIR = None
 
 
 def ground_band(box, shape):
@@ -130,7 +109,7 @@ def save_depth_vis(rgb, depth, obj, ref, path):
 def latest_sam_csv(sam_dir):
     found = sorted(glob.glob(os.path.join(sam_dir, "sam_generated_*.csv")))
     if not found:
-        sys.exit("nessun sam_generated_*.csv in %s: prima sam3_1/eval_on_generated.py" % sam_dir)
+        sys.exit("nessun sam_generated_*.csv in %s: prima annotate_sam.py" % sam_dir)
     return found[-1]
 
 
@@ -138,11 +117,7 @@ def evaluate(clips_dir, sam_dir, sam_csv, model_name, process_res):
     with open(sam_csv, encoding="utf-8") as f:
         sam_rows = list(csv.DictReader(f))
 
-    free, total = torch.cuda.mem_get_info()
-    print("VRAM libera prima di caricare: %.2f GB su %.2f" % (free / 1e9, total / 1e9))
-    if free / 1e9 < VRAM_FREE_MIN_GB:
-        sys.exit("VRAM libera %.2f GB < %.1f GB: la scheda e' ancora occupata."
-                 % (free / 1e9, VRAM_FREE_MIN_GB))
+    gpu.check_vram_free(VRAM_FREE_MIN_GB)
 
     print("modello:      %s" % model_name)
     print("maschere SAM: %s (%d frame)" % (sam_csv, len(sam_rows)))
@@ -217,9 +192,9 @@ def evaluate(clips_dir, sam_dir, sam_csv, model_name, process_res):
                      " il run si ferma invece di proseguire in sysmem fallback."
                      % (peak, VRAM_BUDGET_GB, n))
         if n % TELEMETRY_EVERY == 0:
-            tel = gpu_telemetry()
+            tel = gpu.gpu_telemetry()
             row.update(tel)
-            row["contaminated"] = is_throttling(tel)
+            row["contaminated"] = gpu.is_throttling(tel, TEMP_LIMIT_C)
             if row["contaminated"]:
                 contaminated += 1
                 print("  frame %d: throttling (temp=%s, mask=%s)"
@@ -280,13 +255,32 @@ def summarize(rows):
 def main():
     parser = argparse.ArgumentParser(
         description="DA3 sui frame generati da Wan, con le maschere SAM (passo 0.2 esteso).")
-    parser.add_argument("--clips-dir", default=os.path.join("..", "wan2_2", "outputs", "test_clips"))
-    parser.add_argument("--sam-dir", default=os.path.join("..", "sam3_1", "outputs", "generated_eval"))
+    parser.add_argument("--clips-dir", default=os.path.join("..", "wan2_2", "outputs", "test_clips"),
+                        help="cartella con manifest.jsonl e frames/; sul pod /workspace/out/<modello>")
+    parser.add_argument("--sam-dir", default=os.path.join("outputs", "generated_eval"),
+                        help="dove annotate_sam.py ha scritto masks/ e il suo CSV")
+    parser.add_argument("--out-dir", default=None,
+                        help="dove finiscono depth_vis e CSV (default: --sam-dir)")
     parser.add_argument("--sam-csv", default=None,
                         help="default: il sam_generated_*.csv piu' recente in --sam-dir")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--process-res", type=int, default=DEFAULT_PROCESS_RES)
+    parser.add_argument("--vram-budget-gb", type=float, default=None,
+                        help="stop se il picco supera questa soglia (default: frazione %.2f"
+                             " della VRAM della scheda)" % gpu.VRAM_BUDGET_FRACTION)
+    parser.add_argument("--vram-free-min-gb", type=float, default=gpu.VRAM_FREE_MIN_GB)
+    parser.add_argument("--temp-limit-c", type=int, default=gpu.TEMP_LIMIT_C,
+                        help="sopra questa temperatura la misura e' marcata contaminata")
     args = parser.parse_args()
+
+    global OUT_DIR, VRAM_BUDGET_GB, VRAM_FREE_MIN_GB, TEMP_LIMIT_C
+    OUT_DIR = args.out_dir or args.sam_dir
+    VRAM_FREE_MIN_GB = args.vram_free_min_gb
+    TEMP_LIMIT_C = args.temp_limit_c
+    VRAM_BUDGET_GB = args.vram_budget_gb or gpu.vram_budget_gb()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print("soglie: picco max %.1f GB, libera minima %.1f GB, temperatura %d C"
+          % (VRAM_BUDGET_GB, VRAM_FREE_MIN_GB, TEMP_LIMIT_C))
 
     sam_csv = args.sam_csv or latest_sam_csv(args.sam_dir)
     rows, review, elapsed, contaminated = evaluate(
