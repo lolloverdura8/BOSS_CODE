@@ -1,0 +1,33 @@
+# requirements-a14b.txt — ambiente per Wan2.2-T2V-A14B
+#
+# Vive da solo perche' la model card di Wan-AI/Wan2.2-T2V-A14B-Diffusers
+# (verificata il 15/09/2026) dichiara: "requires features that are currently
+# available only in the main branch of diffusers". La 0.40.0 di
+# requirements-gen.txt non basta, e installare diffusers da main nell'ambiente
+# dei generatori metterebbe a rischio la riproducibilita' degli altri adapter.
+#
+#   pip install -r requirements-a14b.txt --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# ATTENZIONE: "git+...@main" non e' un pin. Alla prima installazione sul pod va
+# registrato lo SHA del commit risolto (pip lo stampa) e scritto qui al posto di
+# main, altrimenti due sessioni diverse girano su due diffusers diversi e il
+# confronto del bake-off perde una variabile controllata.
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.4.6
+
+git+https://github.com/huggingface/diffusers@main
+transformers==5.15.1
+accelerate==1.14.0
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==1.28.0
+hf-xet==1.6.0
+
+ImageIO==2.37.4
+imageio-ffmpeg==0.6.0
+pillow==12.3.0
+psutil==7.2.2
+ftfy==6.3.1
+PyYAML==6.0.3

@@ -1,0 +1,42 @@
+# requirements-gen.txt — ambiente dei generatori video (adapter di cloud/adapters/)
+#
+# Rilevato il 15/09/2026 da synthetic_data_pipeline/wan2_2/.venv (Python 3.11.9),
+# l'ambiente con cui e' stata generata monopattino_00: 569,1 s, picco allocato
+# 12,538 GB. Pinnare queste versioni significa che sul pod gira la stessa cosa
+# che qui ha prodotto quel risultato.
+#
+#   pip install -r requirements-gen.txt --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# Copre: wan22_5b, cogvideox15, hunyuan15.
+# NON copre: wan22_a14b (vuole diffusers da main, vedi requirements-a14b.txt),
+#            opensora2 e ltx25 (pacchetti propri, installati dai loro repo).
+#
+# Escluso dal freeze: colorama (solo Windows).
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.4.6
+
+diffusers==0.40.0
+transformers==5.15.1
+accelerate==1.14.0
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==1.28.0
+hf-xet==1.6.0
+
+# export_to_video di diffusers usa imageio se c'e', e ricade sul ramo OpenCV
+# deprecato (mp4v) se manca. imageio-ffmpeg porta il proprio binario ffmpeg:
+# nessun ffmpeg di sistema da installare sul pod.
+ImageIO==2.37.4
+imageio-ffmpeg==0.6.0
+pillow==12.3.0
+
+# Usato da runner.py per la RAM host nelle misure di memoria.
+psutil==7.2.2
+
+ftfy==6.3.1
+regex==2026.7.19
+PyYAML==6.0.3
+requests==2.34.2
+tqdm==4.70.0
