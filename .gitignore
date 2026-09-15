@@ -17,3 +17,13 @@ synthetic_data_pipeline/sam3_1/sam3/
 test_images/
 PIANO_Dati_Sintetici_OR4.1.MD
 **/CARLA/outputs/
+# --- locale alla workstation, fuori dal repo -------------------------------
+# Su Git va cio' che gira sul pod, piu' il verbale delle fasi chiuse. Questi
+# provano che un ambiente locale funziona: sul pod la stessa cosa la fa
+# cloud/runner.py --limit 1. Restano sul disco, e la storia di git li conserva.
+**/smoke_test.py
+**/vram_benchmark.py
+synthetic_data_pipeline/wan2_2/night_run.py
+
+# Documenti di progetto: vivono in OR4.1/, non nel repo (come il gemello sopra)
+PIANO_ATTACCO_OR4.1.md
