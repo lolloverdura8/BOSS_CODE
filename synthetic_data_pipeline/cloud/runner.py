@@ -79,6 +79,23 @@ def eval_indices(n_frames, k=EVAL_FRAMES):
     return sorted(set(int(round(x)) for x in np.linspace(0, n_frames - 1, k)))
 
 
+def check_frames(frames, modello):
+    """Verifica il contratto di uscita degli adapter e normalizza cio' che si puo'.
+
+    Serve perche' l'errore tipico e' silenzioso: un adapter che restituisce
+    uint8 in 0..255 invece di float in 0..1 produce, dopo il clip a 1.0, frame
+    tutti bianchi. Nessuna eccezione, nessun avviso, e ce ne si accorge solo
+    guardando gli overlay di SAM giorni dopo, sul pod, a GPU pagata.
+    """
+    a = np.asarray(frames)
+    if a.ndim != 4 or a.shape[-1] != 3:
+        raise ValueError("%s: attesi frame (T, H, W, 3), ricevuto %s" % (modello, (a.shape,)))
+    if a.dtype == np.uint8 or a.max() > 1.5:
+        print("  frame %s in 0..%g: normalizzati a float 0..1" % (a.dtype, a.max()))
+        a = a.astype(np.float32) / 255.0
+    return a
+
+
 def save_frames(frames, frame_dir):
     from PIL import Image
     os.makedirs(frame_dir, exist_ok=True)
@@ -211,7 +228,8 @@ def generate_model(name, jobs, out_root, costs, dry_run):
             t0 = time.time()
             frames, esito, errore = None, "ok", ""
             try:
-                frames = adapter.generate(handle, job["prompt"], job["seed"])
+                frames = check_frames(
+                    adapter.generate(handle, job["prompt"], job["seed"]), name)
             except torch.cuda.OutOfMemoryError:
                 esito = "oom"
                 # un'eccezione a meta' pipe() salta maybe_free_model_hooks: senza

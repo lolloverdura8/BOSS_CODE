@@ -137,6 +137,12 @@ def generate(handle, prompt, seed):
         num_frames=SPEC["num_frames"],
         num_inference_steps=SPEC["steps"],
         guidance_scale=SPEC["guidance"],
+        # ESPLICITO, non per pignoleria: in diffusers 0.40.0 WanPipeline ha
+        # output_type="np" di default ma CogVideoXPipeline ha "pil". Lasciare
+        # il default darebbe frame uint8 in 0..255 dove il contratto vuole
+        # float in 0..1, e save_frames li scriverebbe tutti bianchi senza
+        # sollevare niente.
+        output_type="np",
         generator=torch.Generator(device="cuda").manual_seed(seed),
     )
     return np.asarray(out.frames[0])
