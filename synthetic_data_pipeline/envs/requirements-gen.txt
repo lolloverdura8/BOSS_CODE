@@ -40,3 +40,9 @@ regex==2026.7.19
 PyYAML==6.0.3
 requests==2.34.2
 tqdm==4.70.0
+
+# Per il gate in linea di runner.py, che chiama quality_gate.evaluate_clip() su
+# CPU mentre la GPU fa la clip successiva. Variante headless: sul pod non c'e'
+# un server grafico, e quella completa trascina libGL. Senza cv2 il runner non
+# si ferma, ma registra gate_sharpness e gate_ssim vuoti.
+opencv-python-headless==4.11.0.86
