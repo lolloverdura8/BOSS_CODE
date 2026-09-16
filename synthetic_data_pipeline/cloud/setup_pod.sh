@@ -13,14 +13,20 @@
 # la seconda sessione parte in un minuto invece che in un'ora.
 #
 # Prima di lanciarlo, una volta sola:
-#   huggingface-cli login
+#   hf auth login
+# NON "huggingface-cli login": da huggingface_hub 1.x quel comando e' deprecato e
+# si rifiuta di eseguire ("deprecated and no longer works"). I requirements
+# pinnano 1.28.0, quindi sul pod fallisce di sicuro, e fallisce nel passo che
+# autentica l'account: cioe' prima di qualunque download.
 # Con HF_HOME sul volume il token resta li' e tutti i pod successivi che
 # montano lo stesso volume lo ritrovano gia' fatto.
 #
 # ACCESSI DA SISTEMARE PRIMA, ALTRIMENTI SI SCOPRONO A GPU ACCESA:
 #   - facebook/sam3 e' gated: accesso gia' approvato per l'account del progetto
-#   - Lightricks/LTX-2.5-Diffusers e' gated (auto): le condizioni vanno
-#     accettate una volta sulla pagina del modello
+#   - Lightricks/LTX-2.5-Diffusers e' gated (auto): le condizioni vanno accettate
+#     una volta sulla pagina del modello. Fatto: verificato il 16/09/2026 con
+#     l'account lolloverdura8, "hf download ... model_index.json" scarica.
+#     Con un altro account va rifatto: il gate segue l'account, non la macchina.
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
@@ -63,7 +69,7 @@ mkvenv() {  # mkvenv <nome> <requirements>
 SELECTED=()
 for a in "$@"; do
   case "$a" in
-    --list) sed -n '2,20p' "$0"; exit 0 ;;
+    --list) sed -n '2,29p' "$0"; exit 0 ;;
     *) SELECTED+=("$a") ;;
   esac
 done
@@ -165,7 +171,7 @@ from huggingface_hub import HfApi
 try:
     print("HuggingFace: autenticato come %s" % HfApi().whoami().get("name"))
 except Exception as e:
-    print("HuggingFace NON autenticato (%s). Lanciare: huggingface-cli login" % e)
+    print("HuggingFace NON autenticato (%s). Lanciare: hf auth login" % e)
 PY
 
   echo

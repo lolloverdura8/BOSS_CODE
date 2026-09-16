@@ -48,7 +48,7 @@ canali distinti, e nessuno passa per il PC in mezzo:
 | Cosa | Come | Direzione |
 |---|---|---|
 | **Codice** (~100 KB) | git, via GitHub | PC ↔ pod, bidirezionale |
-| **Pesi dei modelli** (~240 GB) | `huggingface-cli download`, con `HF_HOME` sul network volume | HuggingFace → pod |
+| **Pesi dei modelli** (~240 GB) | `hf download`, con `HF_HOME` sul network volume | HuggingFace → pod |
 | **Dati generati** (~15-20 GB) | repo dataset HuggingFace privato | pod → HF → PC |
 
 Sul pod il repo è un clone normale su `/workspace`, cioè sul network volume: sopravvive

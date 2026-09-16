@@ -88,14 +88,14 @@ def main():
     if args.azione == "pull":
         return pull(args.repo, args.dest or "./scaricato", args.patterns)
 
-    # Il token arriva da HF_TOKEN o da huggingface-cli login: con HF_HOME sul
+    # Il token arriva da HF_TOKEN o da hf auth login: con HF_HOME sul
     # network volume, "login" si digita una volta e i pod successivi lo ritrovano.
     api = HfApi()
     try:
         who = api.whoami()
         print("autenticato come %s" % who.get("name"))
     except Exception:
-        sys.exit("non autenticato: HF_TOKEN nell'ambiente, oppure huggingface-cli login.")
+        sys.exit("non autenticato: HF_TOKEN nell'ambiente, oppure hf auth login.")
 
     if args.azione == "info":
         return info(api, args.repo)
