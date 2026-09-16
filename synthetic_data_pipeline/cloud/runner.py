@@ -261,16 +261,33 @@ def generate_model(name, jobs, out_root, costs, dry_run):
 
             if frames is not None:
                 mp4, frame_dir, _ = clip_paths(out_root, job)
-                idx = save_frames(frames, frame_dir)
-                # prima un file temporaneo, poi il nome definitivo: l'mp4 e' il
-                # marcatore di clip completata, e un file troncato da
-                # un'interruzione non deve sembrarlo
-                tmp = mp4 + ".tmp"
-                record["video_backend"] = write_video(frames, tmp, spec["fps"])
-                os.replace(tmp, mp4)
-                record["num_frames_generati"] = len(frames)
-                record["frame_indices"] = idx
-                record.update(run_gate(mp4))
+                try:
+                    idx = save_frames(frames, frame_dir)
+                    # prima un file temporaneo, poi il nome definitivo: l'mp4 e' il
+                    # marcatore di clip completata, e un file troncato da
+                    # un'interruzione non deve sembrarlo
+                    #
+                    # IL TEMPORANEO DEVE FINIRE PER .mp4, non per .tmp: imageio
+                    # sceglie il backend dall'estensione, e con
+                    # "monopattino_00.mp4.tmp" export_to_video muore con
+                    # "Could not find a backend" DOPO aver generato la clip.
+                    # Successo il 16/09/2026 sul pod: sei minuti di GPU buttati
+                    # su un nome di file. generate_test_clips.py usava .tmp.mp4,
+                    # ed e' la forma che sync.py ignora gia'.
+                    tmp = os.path.splitext(mp4)[0] + ".tmp.mp4"
+                    record["video_backend"] = write_video(frames, tmp, spec["fps"])
+                    os.replace(tmp, mp4)
+                    record["num_frames_generati"] = len(frames)
+                    record["frame_indices"] = idx
+                    record.update(run_gate(mp4))
+                except Exception as e:
+                    # I pixel sono gia' in frames/, e un lotto da dieci ore non
+                    # deve morire su una scrittura: si registra l'errore e si
+                    # passa alla clip dopo.
+                    esito = "errore"
+                    errore = "scrittura: %s: %s" % (type(e).__name__, e)
+                    record["esito"], record["errore"] = esito, errore
+                    print("  ERRORE in scrittura: %s" % errore, flush=True)
 
             with open(manifest, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
