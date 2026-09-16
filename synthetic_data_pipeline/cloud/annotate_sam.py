@@ -335,7 +335,7 @@ def main():
     print("misure contaminate da throttling: %d" % contaminated)
     print("tempo totale:      %.1f s" % elapsed)
     summarize(rows)
-    print("\nNOTA: il 54,5%% CARLA e' calcolato PER ISTANZA, questo PER FRAME. Nelle clip"
+    print("\nNOTA: il 54,5% CARLA e' calcolato PER ISTANZA, questo PER FRAME. Nelle clip"
           " generate c'e' un solo oggetto bersaglio per frame, quindi le due misure"
           " coincidono in pratica; nel set CARLA 12 bici su 33 erano occluse dal ciclista.")
     print("NOTA: il processore ridimensiona a 1008x1008 senza preservare l'aspect ratio:"
