@@ -59,8 +59,10 @@ RELEASE_MAX_GB = 0.5
 
 
 def _preflight():
-    import psutil
-    avail = psutil.virtual_memory().available / 1024**3
+    # gpu.host_ram() e non psutil: sul pod psutil riporta la RAM della macchina
+    # e questa guardia non scatterebbe mai, proprio dove serve. Vedi gpu.py.
+    import gpu
+    avail = gpu.host_ram()[1]
     if avail < HOST_RAM_MIN_GB:
         raise SystemExit("RAM host disponibile %.2f GB < %.1f GB richiesti dal caricamento"
                          " di Wan2.2-5B." % (avail, HOST_RAM_MIN_GB))

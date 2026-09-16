@@ -33,6 +33,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import gpu
+
 # NORMALIZZAZIONE CHE RENDE CONFRONTABILI I MODELLI. Ogni generatore ha il suo
 # conteggio nativo di frame (73, 81, 121...), ma il giudizio di SAM e DA3 deve
 # poggiare sullo stesso numero di campioni per clip, altrimenti un modello che
@@ -61,14 +63,24 @@ def _on_stop(signum, frame):
 
 
 def mem_snapshot():
-    """Le cinque metriche di vram_benchmark.py, stessi nomi e stesse unita' (GiB)."""
+    """Le cinque metriche di vram_benchmark.py, stessi nomi e stesse unita' (GiB).
+
+    host_avail_gb passa per gpu.host_ram() e non piu' per psutil: dentro un
+    container psutil legge la RAM della macchina, e il manifest avrebbe
+    registrato 125 GiB liberi su un pod che ne concedeva 31 (gpu.py, in fondo).
+    host_ram_src dice da dove viene il numero, cosi' il caso non si ripresenta
+    muto.
+    """
     free, total = torch.cuda.mem_get_info()
+    ram_totale, ram_disp, ram_src = gpu.host_ram()
     return {
         "vram_alloc_peak_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
         "vram_reserved_peak_gb": round(torch.cuda.max_memory_reserved() / 1024**3, 3),
         "vram_device_used_gb": round((total - free) / 1024**3, 3),
         "host_rss_gb": round(PROC.memory_info().rss / 1024**3, 3),
-        "host_avail_gb": round(psutil.virtual_memory().available / 1024**3, 3),
+        "host_avail_gb": round(ram_disp, 3),
+        "host_total_gb": round(ram_totale, 3),
+        "host_ram_src": ram_src,
     }
 
 

@@ -106,3 +106,93 @@ def check_vram_free(min_gb=VRAM_FREE_MIN_GB):
         raise SystemExit("VRAM libera %.2f GB < %.1f GB richiesti: la scheda e' ancora"
                          " occupata da un altro processo." % (free / 1e9, min_gb))
     return free / 1e9, total / 1e9
+
+
+# --------------------------------------------------------------------------
+# RAM HOST. Dentro un container psutil legge /proc/meminfo, che e' quello della
+# MACCHINA e non del container. Misurato il 16/09/2026 sul primo pod RunPod
+# (RTX PRO 4000, EU-RO-1): "free -g" dichiarava 125 GiB totali e "nproc" 48
+# core, mentre il cgroup concedeva 30.999.998.464 byte e 10,2 core. Un processo
+# che avesse creduto ai 125 GiB sarebbe stato ucciso dal kernel al superamento
+# del cgroup: nessuna eccezione Python, nessuna riga di log, solo il processo
+# sparito a meta' clip. E' la stessa classe di guasto silenzioso di output_type.
+#
+# Quindi: si legge il cgroup, e si ripiega su psutil dove non c'e' (Windows, e
+# Linux fuori da un container).
+#
+# Unita': GiB, come gli altri campi host del manifest. La VRAM qui sopra e' in
+# GB decimali: sono due convenzioni diverse, ma vengono dai valori gia' misurati
+# il 14/09 e cambiarle romperebbe il confronto con quelli.
+
+_CGROUPS = (
+    ("cgroup v2", "/sys/fs/cgroup/memory.max",
+                  "/sys/fs/cgroup/memory.current",
+                  "/sys/fs/cgroup/memory.stat"),
+    ("cgroup v1", "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                  "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                  "/sys/fs/cgroup/memory/memory.stat"),
+)
+
+# Senza tetto, v1 scrive 9223372036854771712 e v2 la parola "max": oltre questa
+# soglia "limite" vuol dire "nessun limite", e la risposta giusta e' psutil.
+_NO_LIMIT = 1 << 62
+
+_ram_source_reported = False
+
+
+def _read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_stat(path):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                chiave, _, valore = line.partition(" ")
+                try:
+                    out[chiave] = int(valore)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _cgroup_ram():
+    for nome, maxp, curp, statp in _CGROUPS:
+        limite = _read_int(maxp)
+        if limite is None or limite >= _NO_LIMIT:
+            continue
+        stat = _read_stat(statp)
+        # La page cache inattiva risulta occupata ma il kernel la cede sotto
+        # pressione. Contarla come spesa farebbe scattare la guardia subito dopo
+        # il download dei checkpoint, quando 240 GB di letture hanno riempito la
+        # cache fino al tetto: si rifiuterebbe di caricare avendo la RAM libera.
+        cedibile = stat.get("inactive_file", 0) + stat.get("slab_reclaimable", 0)
+        usata = max(0, (_read_int(curp) or 0) - cedibile)
+        return limite / 1024**3, (limite - usata) / 1024**3, nome
+    return None
+
+
+def host_ram():
+    """(totale, disponibile, sorgente) in GiB, del container quando ce n'e' uno.
+
+    La sorgente e' parte della risposta, non un dettaglio: un numero di RAM
+    senza provenienza e' esattamente cio' che ha reso invisibile questo bug.
+    """
+    global _ram_source_reported
+    misura = _cgroup_ram()
+    if misura is None:
+        import psutil
+        m = psutil.virtual_memory()
+        misura = (m.total / 1024**3, m.available / 1024**3, "psutil")
+    if not _ram_source_reported:
+        print("RAM host: tetto %.1f GiB, disponibili %.1f GiB, letti da %s"
+              % (misura[0], misura[1], misura[2]))
+        _ram_source_reported = True
+    return misura
