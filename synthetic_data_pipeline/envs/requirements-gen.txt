@@ -21,6 +21,22 @@ diffusers==0.40.0
 transformers==5.15.1
 accelerate==1.14.0
 tokenizers==0.22.2
+
+# Il tokenizer di CogVideoX1.5 e' un modello SentencePiece (tokenizer/spiece.model).
+# Senza questo pacchetto transformers non riesce a leggerlo, RIPIEGA sull'estrattore
+# TikToken e poi muore con "`tiktoken` is required to read a `tiktoken` file".
+# Successo sul pod A100 il 17/09/2026. La cura e' sentencepiece, non tiktoken: il
+# ripiego leggerebbe il vocabolario per un'altra strada, e una tokenizzazione
+# diversa vorrebbe dire prompt diversi -- in un confronto fra modelli e' proprio
+# la variabile che deve restare ferma.
+sentencepiece==0.2.2
+
+# Backend di attenzione scaricati gia' compilati dall'Hub (kernels-community/
+# flash-attn2). Servono a HunyuanVideo-1.5: a 121 frame in 720p senza flash
+# attention il picco misurato e' 65,94 GB e va in OOM anche su 80 GB, nonostante
+# enable_model_cpu_offload e il tiling del VAE. diffusers 0.40.0 pretende
+# kernels>=0.12; niente compilazione, il kernel arriva precompilato.
+kernels==0.17.1
 safetensors==0.8.0
 huggingface_hub==1.28.0
 hf-xet==1.6.0

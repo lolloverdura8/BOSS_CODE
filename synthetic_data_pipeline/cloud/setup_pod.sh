@@ -44,6 +44,9 @@ TORCH_INDEX="https://download.pytorch.org/whl/cu128"
 SAM3_COMMIT="8f0b7f4d4e7eda2ed606ebde6702c93359ad01da"
 DA3_COMMIT="3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
 
+# Com'era la variabile PRIMA che la sovrascrivessimo: serve al blocco check
+# per accorgersi che la shell interattiva punta altrove.
+HF_HOME_EREDITATO="${HF_HOME:-(non impostata)}"
 export HF_HOME="$WORKSPACE/hf"
 
 say() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
@@ -156,6 +159,21 @@ fi
 if want check; then
   say "check: cosa c'e' davvero"
   echo "HF_HOME=$HF_HOME  ($(du -sh "$HF_HOME" 2>/dev/null | cut -f1) di checkpoint)"
+
+  # QUESTO CONTROLLO ESISTE PERCHE' E' GIA' COSTATO. Il 17/09/2026, su un pod
+  # nuovo, la shell aveva HF_HOME=/workspace/.cache/huggingface: il token salvato
+  # in /workspace/hf non veniva trovato, LTX-2.5 (gated) rispondeva 401 e i
+  # checkpoint gia' scaricati venivano ripresi da capo in una seconda cache.
+  # La ragione e' che l'export vive in ~/.bashrc, cioe' in /root, cioe' SUL
+  # CONTAINER DISK, che il Terminate cancella: il token sopravvive sul volume, la
+  # variabile che dice dove cercarlo no. Va riesportata a ogni pod nuovo.
+  if [ "$HF_HOME_EREDITATO" != "$HF_HOME" ]; then
+    echo
+    echo "!!! la shell che ti ha lanciato ha HF_HOME=$HF_HOME_EREDITATO"
+    echo "!!! ma il token e i checkpoint stanno in $HF_HOME"
+    echo "!!! prima di lanciare runner.py:  export HF_HOME=$HF_HOME"
+    echo
+  fi
   for v in gen a14b ann opensora; do
     if [ -x "$VENVS/$v/bin/python" ]; then
       printf '%-9s %s\n' "$v" "$("$VENVS/$v/bin/python" -V 2>&1)"
