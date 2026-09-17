@@ -210,9 +210,36 @@ class Costs:
                  left / 3600, (el + left) / 3600 * self.rate), flush=True)
 
 
+def registra_fallimento(name, jobs, out_root, costs, spec, errore):
+    """Un modello che non carica non deve portarsi via il lotto.
+
+    Senza questo, un import mancante o un OOM dentro adapter.load() solleva
+    fuori dal ciclo delle clip e uccide anche i modelli SUCCESSIVI, che non
+    sono ancora stati provati: in un bake-off da dieci ore si perde tutto il
+    resto per colpa del primo che sbaglia. Qui il guasto diventa una riga di
+    manifest per ogni clip prevista, e si passa al modello dopo.
+    """
+    cartella = os.path.join(out_root, name)
+    os.makedirs(cartella, exist_ok=True)
+    print("  MODELLO SALTATO: %s" % errore, flush=True)
+    with open(os.path.join(cartella, "manifest.jsonl"), "a", encoding="utf-8") as f:
+        for job in jobs:
+            record = dict(job, esito="errore", tempo_s=0.0, eval_frames=EVAL_FRAMES,
+                          errore=errore, adapter_spec=spec, usd_stimati=0.0)
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            costs.tick("errore")
+    return {"ok": 0, "oom": 0, "errore": len(jobs), "saltate": 0}
+
+
 def generate_model(name, jobs, out_root, costs, dry_run):
-    adapter = importlib.import_module("adapters.%s" % name)
-    spec = dict(adapter.SPEC)
+    # Anche l'import puo' fallire: un adapter che importa un pacchetto assente
+    # nel venv in uso solleva qui, prima ancora di vedere la GPU.
+    try:
+        adapter = importlib.import_module("adapters.%s" % name)
+        spec = dict(adapter.SPEC)
+    except Exception as e:
+        return registra_fallimento(name, jobs, out_root, costs, None,
+                                   "import: %s: %s" % (type(e).__name__, e))
     print("\n=== %s ===" % name)
     print("spec: %s" % json.dumps(spec, ensure_ascii=False, default=str))
 
@@ -230,7 +257,14 @@ def generate_model(name, jobs, out_root, costs, dry_run):
     # (UMT5-XXL di Wan pesa 11,36 GB, quasi meta' del modello) li codificano
     # tutti in blocco e poi lo rilasciano: e' l'ottimizzazione che fa entrare
     # Wan2.2-5B in 16 GB. Chi non ne ha bisogno ignora l'argomento.
-    handle = adapter.load([j["prompt"] for j in todo])
+    # SystemExit oltre a Exception: le guardie di pre-volo degli adapter (VRAM
+    # e RAM host insufficienti) sollevano SystemExit, che NON discende da
+    # Exception e passerebbe attraverso un except Exception senza fermarsi.
+    try:
+        handle = adapter.load([j["prompt"] for j in todo])
+    except (Exception, SystemExit) as e:
+        return registra_fallimento(name, todo, out_root, costs, spec,
+                                   "load: %s: %s" % (type(e).__name__, e))
     esiti = {"ok": 0, "oom": 0, "errore": 0, "saltate": len(jobs) - len(todo)}
     try:
         for n, job in enumerate(todo):
