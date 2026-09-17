@@ -56,25 +56,34 @@ def load(prompts):
         print("ATTENZIONE: guider non riconfigurato (%s); SPEC['guidance'] potrebbe non"
               " corrispondere a quella usata davvero." % e)
 
-    # Backend di attenzione: serve, non e' un ottimizzazione. A 121 frame in 720p,
-    # col backend di default, il picco misurato e' 65,94 GB e va in OOM anche su
+    # BACKEND DI ATTENZIONE: serve, non e' un'ottimizzazione. A 121 frame in 720p
+    # col backend di default il picco misurato e' 65,94 GB e va in OOM anche su
     # un'A100 da 80, nonostante offload e tiling.
     #
-    # E VA CHIESTA LA VERSIONE 2, NON LA 3. FlashAttention 3 non supporta
-    # attn_mask, che HunyuanVideo usa: il 17/09/2026 sull'A100
-    # set_attention_backend("_flash_3_hub") e' RIUSCITO -- si limita a scaricare
-    # il kernel -- e la generazione e' morta al primo step con "`attn_mask` is
-    # not supported for flash-attn 3", dopo 22,8 s di GPU. Che un backend si
-    # imposti non vuol dire che funzioni per questo modello, quindi la 3 non si
-    # prova nemmeno come ripiego: fallirebbe piu' tardi e in modo piu' oscuro.
-    # (La 3 e' anche solo Hopper, e qui la scheda e' Ampere.)
-    try:
-        pipe.transformer.set_attention_backend("flash_hub")
-        print("attention backend: flash_hub")
-    except Exception as e:
-        print("attention backend: quello di default, flash_hub non disponibile (%s)."
-              " Con 121 frame in 720p e' probabile un OOM: serve il pacchetto"
-              " 'kernels'." % e)
+    # VA CHIESTA LA VARIANTE *VARLEN*. HunyuanVideo passa una attn_mask (e' il
+    # padding del prompt nella cross-attention), e le varianti dense di flash la
+    # rifiutano entrambe. Provate e fallite sull'A100 il 17/09/2026:
+    #   _flash_3_hub -> "`attn_mask` is not supported for flash-attn 3"
+    #   flash_hub    -> "`attn_mask` is not supported for flash-attn 2"
+    # In tutti e due i casi set_attention_backend() era RIUSCITO: si limita a
+    # scaricare il kernel, e il guasto arriva al primo step, dopo il caricamento.
+    #
+    # flash_varlen_hub invece la maschera la gestisce: la normalizza, la converte
+    # in cu_seqlens e impacchetta K e V (attention_dispatch.py di diffusers
+    # 0.40.0). Il limite dichiarato li' riguarda solo il caso ring_degree > 1,
+    # cioe' context parallel su piu' GPU, che qui non c'e'.
+    # _native_efficient e' il kernel memory-efficient di PyTorch: accetta la
+    # maschera, non chiede il pacchetto kernels, ed e' il ripiego.
+    for backend in ("flash_varlen_hub", "_native_efficient"):
+        try:
+            pipe.transformer.set_attention_backend(backend)
+            print("attention backend: %s" % backend)
+            break
+        except Exception as e:
+            print("attention backend %s non disponibile (%s)" % (backend, e))
+    else:
+        print("attention backend: quello di default. A 121 frame in 720p e'"
+              " probabile un OOM.")
 
     return {"pipe": pipe}
 
