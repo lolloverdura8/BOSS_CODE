@@ -56,18 +56,25 @@ def load(prompts):
         print("ATTENZIONE: guider non riconfigurato (%s); SPEC['guidance'] potrebbe non"
               " corrispondere a quella usata davvero." % e)
 
-    # La documentazione raccomanda un backend di attenzione che gestisca bene il
-    # padding delle sequenze a lunghezza variabile: flash_hub su A100 e 4090,
-    # _flash_3_hub su H100. Se non c'e', si va avanti col backend di default.
-    for backend in ("_flash_3_hub", "flash_hub"):
-        try:
-            pipe.transformer.set_attention_backend(backend)
-            print("attention backend: %s" % backend)
-            break
-        except Exception:
-            continue
-    else:
-        print("attention backend: quello di default (flash non disponibile)")
+    # Backend di attenzione: serve, non e' un ottimizzazione. A 121 frame in 720p,
+    # col backend di default, il picco misurato e' 65,94 GB e va in OOM anche su
+    # un'A100 da 80, nonostante offload e tiling.
+    #
+    # E VA CHIESTA LA VERSIONE 2, NON LA 3. FlashAttention 3 non supporta
+    # attn_mask, che HunyuanVideo usa: il 17/09/2026 sull'A100
+    # set_attention_backend("_flash_3_hub") e' RIUSCITO -- si limita a scaricare
+    # il kernel -- e la generazione e' morta al primo step con "`attn_mask` is
+    # not supported for flash-attn 3", dopo 22,8 s di GPU. Che un backend si
+    # imposti non vuol dire che funzioni per questo modello, quindi la 3 non si
+    # prova nemmeno come ripiego: fallirebbe piu' tardi e in modo piu' oscuro.
+    # (La 3 e' anche solo Hopper, e qui la scheda e' Ampere.)
+    try:
+        pipe.transformer.set_attention_backend("flash_hub")
+        print("attention backend: flash_hub")
+    except Exception as e:
+        print("attention backend: quello di default, flash_hub non disponibile (%s)."
+              " Con 121 frame in 720p e' probabile un OOM: serve il pacchetto"
+              " 'kernels'." % e)
 
     return {"pipe": pipe}
 

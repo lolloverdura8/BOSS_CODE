@@ -30,6 +30,10 @@ tokenizers==0.22.2
 # diversa vorrebbe dire prompt diversi -- in un confronto fra modelli e' proprio
 # la variabile che deve restare ferma.
 sentencepiece==0.2.2
+# E protobuf, perche' l'estrattore SentencePiece di transformers lo importa per
+# leggere spiece.model. Senza, il messaggio cambia ma il finale e' lo stesso:
+# ripiego su TikToken e ValueError. Vanno insieme, non uno solo dei due.
+protobuf==7.36.1
 
 # Backend di attenzione scaricati gia' compilati dall'Hub (kernels-community/
 # flash-attn2). Servono a HunyuanVideo-1.5: a 121 frame in 720p senza flash
