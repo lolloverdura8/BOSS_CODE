@@ -8,21 +8,27 @@
 #
 #   pip install -r requirements-a14b.txt --extra-index-url https://download.pytorch.org/whl/cu128
 #
-# ATTENZIONE: "git+...@main" non e' un pin. Alla prima installazione sul pod va
-# registrato lo SHA del commit risolto (pip lo stampa) e scritto qui al posto di
-# main, altrimenti due sessioni diverse girano su due diffusers diversi e il
-# confronto del bake-off perde una variabile controllata.
+# PIN FATTO il 17/09/2026 sul pod A100: "main" risolveva a
+# 37ce5add81f5b0838b744f03dcc2238ffc740cbc, cioe' diffusers 0.41.0.dev0, e da
+# allora e' quello lo SHA scritto qui sotto. Con "@main" due sessioni diverse
+# avrebbero girato su due diffusers diversi e il confronto del bake-off avrebbe
+# perso una variabile controllata.
+#
+# huggingface_hub NON e' 1.28.0 come negli altri due ambienti: diffusers
+# 0.41.0.dev0 dichiara "huggingface-hub<2.0 and >=1.31.0", e con 1.28.0 pip si
+# ferma con ResolutionImpossible. Gli ambienti sono separati, quindi la
+# differenza non tocca gli altri adapter.
 
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 numpy==2.4.6
 
-git+https://github.com/huggingface/diffusers@main
+git+https://github.com/huggingface/diffusers@37ce5add81f5b0838b744f03dcc2238ffc740cbc
 transformers==5.15.1
 accelerate==1.14.0
 tokenizers==0.22.2
 safetensors==0.8.0
-huggingface_hub==1.28.0
+huggingface_hub==1.31.0
 hf-xet==1.6.0
 
 ImageIO==2.37.4

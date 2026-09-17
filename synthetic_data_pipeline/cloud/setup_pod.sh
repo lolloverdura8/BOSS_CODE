@@ -106,13 +106,12 @@ if want gen; then
 fi
 
 if want a14b; then
-  say "a14b: Wan2.2-T2V-A14B (diffusers da main)"
+  say "a14b: Wan2.2-T2V-A14B (diffusers pinnato a 37ce5add)"
   mkvenv a14b "$ENVS_SRC/requirements-a14b.txt"
-  # "git+...@main" non e' un pin: registrare lo SHA risolto, altrimenti due
-  # sessioni girano su due diffusers diversi e il bake-off perde una variabile
-  # controllata.
+  # Lo SHA e' stato registrato il 17/09/2026 e ora sta nel requirements: questo
+  # pip show serve a confermare che l'ambiente monti davvero quel commit.
   "$VENVS/a14b/bin/pip" show diffusers | sed -n '1,3p'
-  echo ">>> annotare questa versione di diffusers in envs/requirements-a14b.txt"
+  echo ">>> atteso: 0.41.0.dev0 dal commit 37ce5add"
 fi
 
 # --------------------------------------------------------------------------
