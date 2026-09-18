@@ -196,3 +196,33 @@ def host_ram():
               % (misura[0], misura[1], misura[2]))
         _ram_source_reported = True
     return misura
+
+
+# --------------------------------------------------------------------------
+# NOME DELLA SCHEDA. Il bake-off confronta $/istanza_utile, e quel numero
+# dipende dai secondi per clip: una proprieta' della GPU, non del modello.
+# Il 17-18/09/2026 le misure sono arrivate da schede diverse in sessioni
+# diverse (5070 Ti in locale, RTX PRO 4000 e poi A100 sul pod) e il manifest
+# non registrava su quale: senza questo campo, due clip dello stesso modello
+# generate su schede diverse finiscono nella stessa tabella senza che nulla
+# lo segnali, e il confronto e' silenziosamente falsato.
+_gpu_name_cache = None
+
+
+def gpu_name():
+    """Il modello della GPU corrente, cosi' com'e' riportato da nvidia-smi.
+
+    Interrogata una volta sola per processo: non cambia durante un run.
+    "sconosciuta" (non None) se nvidia-smi non risponde, per restare un
+    valore stringa scrivibile in CSV/JSON senza casi speciali a valle.
+    """
+    global _gpu_name_cache
+    if _gpu_name_cache is None:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL, text=True, timeout=10)
+            _gpu_name_cache = out.strip().splitlines()[0].strip()
+        except Exception:
+            _gpu_name_cache = "sconosciuta"
+    return _gpu_name_cache

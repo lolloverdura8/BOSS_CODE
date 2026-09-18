@@ -70,6 +70,13 @@ def mem_snapshot():
     registrato 125 GiB liberi su un pod che ne concedeva 31 (gpu.py, in fondo).
     host_ram_src dice da dove viene il numero, cosi' il caso non si ripresenta
     muto.
+
+    gpu_model: il 17-18/09/2026 le stesse otto clip di un modello sono state
+    misurate su tre schede diverse in sessioni diverse (5070 Ti, RTX PRO 4000,
+    A100) senza che il manifest lo registrasse. compare_models.py confronta
+    $/istanza_utile, che dipende dai secondi per clip -- una proprieta' della
+    GPU. Senza questo campo due righe dello stesso modello su schede diverse
+    finiscono nella stessa tabella senza che nulla lo segnali.
     """
     free, total = torch.cuda.mem_get_info()
     ram_totale, ram_disp, ram_src = gpu.host_ram()
@@ -81,6 +88,7 @@ def mem_snapshot():
         "host_avail_gb": round(ram_disp, 3),
         "host_total_gb": round(ram_totale, 3),
         "host_ram_src": ram_src,
+        "gpu_model": gpu.gpu_name(),
     }
 
 

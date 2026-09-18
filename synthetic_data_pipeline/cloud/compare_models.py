@@ -138,6 +138,19 @@ def metrics(manifest, sam_rows, da3_rows, usd_per_hour):
     picchi = [r["vram_alloc_peak_gb"] for r in ok if r.get("vram_alloc_peak_gb")]
     m["vram_peak_max"] = max(picchi) if picchi else None
 
+    # $/istanza_utile dipende dai secondi per clip, una proprieta' della GPU:
+    # le otto clip di un modello vanno misurate sulla stessa scheda, altrimenti
+    # m7_s_per_clip e' una media fra hardware diversi e il confronto e' falsato
+    # senza che il numero lo segnali. Le clip precedenti a questo campo (17/09)
+    # non hanno "gpu_model": contano come sconosciute, non come un terzo valore.
+    gpu_visti = {r["gpu_model"] for r in ok if r.get("gpu_model")}
+    if len(gpu_visti) == 1:
+        m["gpu_model"] = gpu_visti.pop()
+    elif len(gpu_visti) > 1:
+        m["gpu_model"] = "MISTE: %s" % ", ".join(sorted(gpu_visti))
+    else:
+        m["gpu_model"] = None
+
     # --- (1) e (2) ----------------------------------------------------------
     n_eval = ok[0].get("eval_frames") if ok and ok[0].get("eval_frames") else None
     if n_eval is None and manifest:
@@ -184,12 +197,21 @@ def render(results, usd_per_hour):
         ("M6 cv", "%7s", lambda k, m: fmt(m["m6_cv_area_med"], "%.3f")),
         ("ist/clip", "%9s", lambda k, m: fmt(m["istanze_utili_per_clip"], "%.2f")),
         ("$/ist.", "%8s", lambda k, m: fmt(m["usd_per_istanza_utile"], "%.4f")),
+        ("GPU", " %-18s", lambda k, m: (m["gpu_model"] or "-")[:18]),
     ]
     head = "".join(f % h for h, f, _ in cols)
     print(head)
     print("-" * len(head))
     for k, m in results.items():
         print("".join(f % g(k, m) for _, f, g in cols))
+
+    miste = [k for k, m in results.items()
+             if isinstance(m.get("gpu_model"), str) and m["gpu_model"].startswith("MISTE")]
+    if miste:
+        print("\n!!! %s: clip ok generate su schede diverse. s/clip e $/ist. sono una"
+              " media fra hardware diversi e NON vanno confrontati con gli altri"
+              " modelli. Rigenerare sulla stessa GPU prima di trarre conclusioni."
+              % ", ".join(miste))
 
     print("\nRiferimento M1: %.1f%% (bicicletta CARLA in modalita' testo, B.1-B.4)."
           % RIFERIMENTO_SAM_CARLA)
