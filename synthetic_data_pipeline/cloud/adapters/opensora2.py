@@ -95,6 +95,32 @@ def _read_video(path):
     return np.stack(frames).astype(np.float32) / 255.0
 
 
+# Quante righe di coda tenere dei due flussi quando il sottoprocesso fallisce.
+# 25 non bastavano: torchrun incapsula il traceback del figlio dentro un
+# ChildFailedError e stampa una ventina di righe di impalcatura sua, quindi una
+# coda corta mostra solo quella e nasconde la causa. Successo il 18/09/2026 al
+# primo tentativo di Open-Sora sul pod: l'errore utile stava piu' su.
+CODA_RIGHE = 80
+
+
+def _coda(testo, n=CODA_RIGHE):
+    righe = (testo or "").strip().splitlines()
+    return "\n".join(righe[-n:]) if righe else "(vuoto)"
+
+
+def _diagnosi(r):
+    """Il messaggio d'errore con entrambi i flussi.
+
+    Serve stdout oltre a stderr perche' gli script di Open-Sora stampano li'
+    sia la configurazione risolta sia buona parte degli errori di caricamento:
+    col solo stderr si legge il fallimento del launcher, non cio' che l'ha
+    causato.
+    """
+    return ("torchrun uscito con %d.\n\n--- stderr (ultime %d righe) ---\n%s"
+            "\n\n--- stdout (ultime %d righe) ---\n%s"
+            % (r.returncode, CODA_RIGHE, _coda(r.stderr), CODA_RIGHE, _coda(r.stdout)))
+
+
 def generate(handle, prompt, seed):
     # Una cartella vuota per clip: il nome del file lo decide get_save_path_name
     # dentro il repo e non e' prevedibile da qui, quindi invece di indovinarlo si
@@ -117,12 +143,11 @@ def generate(handle, prompt, seed):
         ]
         r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError("torchrun uscito con %d.\nstderr (ultime righe):\n%s"
-                               % (r.returncode, "\n".join(r.stderr.strip().splitlines()[-25:])))
+            raise RuntimeError(_diagnosi(r))
         mp4 = sorted(glob.glob(os.path.join(out_dir, "**", "*.mp4"), recursive=True))
         if not mp4:
-            raise RuntimeError("nessun mp4 prodotto in %s.\nstdout (ultime righe):\n%s"
-                               % (out_dir, "\n".join(r.stdout.strip().splitlines()[-25:])))
+            raise RuntimeError("nessun mp4 prodotto in %s, ma torchrun e' uscito con 0.\n%s"
+                               % (out_dir, _diagnosi(r)))
         if len(mp4) > 1:
             print("  attenzione: %d mp4 prodotti, prendo il primo" % len(mp4))
         return _read_video(mp4[0])
