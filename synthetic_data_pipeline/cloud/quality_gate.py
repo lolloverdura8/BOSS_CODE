@@ -51,15 +51,16 @@ import numpy as np
 # misurate: la varianza del Laplaciano dipende dalla scala, quindi ricalibrare
 # quando cambia la risoluzione di generazione.
 #
-# CALIBRATION_RESOLUTION non e' piu' passata a nessuna chiamata: da quando
-# --calibrate ragiona per altezza, resta qui solo a dichiarare a che risoluzione
-# fu misurata la SHARPNESS_MIN qui sotto, che invece e' viva e la usa runner.py.
+# VALORI STORICI, NON APPLICATI DA NESSUNA PARTE. Restano per non perdere la
+# provenienza di un numero che si e' visto in giro nei manifest fino al
+# 21/09/2026: 370 era il centro geometrico del vuoto fra i frame rovinati (fino
+# a 161) e i buoni peggiori (848), misurato pero' a 720x480. A quella
+# risoluzione voleva dire qualcosa; applicato alle clip del bake-off, che stanno
+# fra 0,90 e 1,04 Mpx, ne marcava "sfocate" tre su cinque confrontando grandezze
+# non commensurabili. Il verdetto sulla nitidezza e' stato tolto: vedi
+# evaluate_clip.
 CALIBRATION_RESOLUTION = (720, 480)
-
-# Calibrata: i frame rovinati arrivano al massimo a 161, i buoni peggiori stanno
-# a 848 (la clip CogVideoX; il render CARLA parte da 1003). Fra le due
-# popolazioni c'e' un fattore 5, e 370 e' il centro geometrico del vuoto.
-SHARPNESS_MIN = 370.0
+SHARPNESS_MIN_STORICA = 370.0
 
 # Qui la soglia NON e' il centro del vuoto, che la calibrazione propone a 0,83, e
 # la deroga e' deliberata. I negativi che si possono fabbricare - frame duplicati
@@ -99,19 +100,6 @@ SSIM_MAX = 0.95
 # dell'errore. La SSIM invece resta fra 0,794 e 0,819 sulle stesse quattro
 # altezze: e' normalizzata, e non ha bisogno di questa cautela.
 NORMALIZED_HEIGHT = 704
-
-# NESSUNA SOGLIA AD ALTEZZA NORMALIZZATA, ED E' UNA SCELTA.
-#
-# Una soglia si ricava confrontando due popolazioni: immagini sicuramente buone
-# e le stesse immagini rovinate di proposito. Le uniche immagini sicuramente
-# buone disponibili erano i render del simulatore, che il progetto ha deciso di
-# non usare come riferimento. Senza una popolazione di confronto la soglia
-# sarebbe arbitraria, e un verdetto arbitrario e' peggio di nessun verdetto.
-#
-# Il gate ad altezza normalizzata produce quindi solo valori grezzi. Servono a
-# confrontare i modelli FRA LORO, che e' la domanda del bake-off; non dicono se
-# una clip sia buona in assoluto, che e' una domanda a cui qui non si risponde.
-SHARPNESS_MIN_NORMALIZED = None
 
 # Passo temporale di riferimento per la SSIM confrontabile fra modelli, in
 # secondi. Gli fps nativi vanno da 8 (CogVideoX) a 24 (Wan, LTX, Hunyuan): fra
@@ -263,27 +251,23 @@ def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT, crop=
     sharp_med = float(np.median(sharp))
     ssim_med = float(np.median(sims))
 
-    # La soglia di nitidezza vale solo alla risoluzione a cui e' stata calibrata.
-    # Normalizzando si cambia scala, quindi serve l'altra soglia; se non e'
-    # ancora stata ricavata si dichiara "non calibrato" invece di dare un
-    # verdetto con la soglia sbagliata.
-    if target_height is None:
-        soglia_nitidezza, dove = SHARPNESS_MIN, None
-    else:
-        soglia_nitidezza, dove = SHARPNESS_MIN_NORMALIZED, "h=%d" % target_height
-
+    # LA NITIDEZZA SI MISURA MA NON GIUDICA, e la ragione non e' rinuncia.
+    #
+    # Una soglia su questa grandezza deve dire "sotto questo valore la clip
+    # danneggia il dataset". Quella frase si puo' verificare, ma con i tassi di
+    # annotazione: se le clip piu' morbide producono meno istanze utili, il
+    # legame e' misurabile e la soglia esce da li'. Finche' M1 e M4 non ci sono
+    # per tutti i modelli, qualunque numero sarebbe scelto e non ricavato.
+    #
+    # Il valore storico 370 era peggio che arbitrario: calibrato a 720x480, ha
+    # marcato "sfocate" tre clip su cinque del bake-off, che stanno fra 0,90 e
+    # 1,04 Mpx. La varianza del Laplaciano cambia di 2,6 volte con la scala
+    # (vedi CROP_SIZE), quindi confrontava grandezze non commensurabili.
+    #
+    # Resta il solo criterio della clip congelata, che e' l'unico che non ha
+    # bisogno di un riferimento esterno: il suo negativo si fabbrica dalla clip
+    # stessa duplicandone i fotogrammi.
     reasons = []
-    if soglia_nitidezza is not None and sharp_med < soglia_nitidezza:
-        if dove is None:
-            # Parola per parola il testo di prima. Finisce in gate_note dentro
-            # manifest.jsonl, che e' un file in append: due formati diversi nello
-            # stesso file, a seconda di quando la clip e' stata generata, sono
-            # rumore che qualcuno un giorno dovrebbe spiegarsi.
-            reasons.append("sfocata (nitidezza %.0f < %.0f)"
-                           % (sharp_med, soglia_nitidezza))
-        else:
-            reasons.append("sfocata (nitidezza %.0f < %.0f a %s)"
-                           % (sharp_med, soglia_nitidezza, dove))
     # La SSIM si controlla sui frame CONSECUTIVI anche quando si conosce ref_dt:
     # ssim_dt e' sempre <= ssim consecutiva, perche' fra i due frame passa piu'
     # tempo, quindi la consecutiva e' il test conservativo per il difetto che
@@ -298,12 +282,10 @@ def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT, crop=
         "sharpness_min": round(float(np.min(sharp)), 1),
         "ssim_median": round(ssim_med, 4),
         "ssim_max": round(float(np.max(sims)), 4),
-        # Tre esiti e non due: senza soglia di nitidezza non si puo' dire
-        # "tieni", ma una clip congelata resta riconoscibile lo stesso, perche'
-        # quel criterio una soglia ce l'ha.
-        "verdict": ("scarta" if reasons
-                    else ("solo valori grezzi" if soglia_nitidezza is None
-                          else "tieni")),
+        # Binario, e riguarda solo la clip congelata: "tieni" non vuol dire
+        # "clip buona", vuol dire "non e' ferma". Il giudizio sulla nitidezza
+        # non c'e' e non e' sottinteso.
+        "verdict": "scarta" if reasons else "tieni",
         "reason": "; ".join(reasons),
     }
 
@@ -472,12 +454,10 @@ def calibrate(good_dir, clip_path, target_height, limit, out_dir):
         print("  SOGLIA SUPERIORE proposta: %.4f" % thr_ssim)
 
     print("\ndistribuzioni: %s" % path)
-    print("soglie attualmente nel codice: nitidezza >= %.0f a 720x480, %s ad"
-          " altezza %d; SSIM <= %.4f"
-          % (SHARPNESS_MIN,
-             "NON ANCORA CALIBRATA" if SHARPNESS_MIN_NORMALIZED is None
-             else "%.0f" % SHARPNESS_MIN_NORMALIZED,
-             NORMALIZED_HEIGHT, SSIM_MAX))
+    print("soglia attualmente applicata: solo SSIM <= %.4f, per la clip"
+          " congelata. Sulla nitidezza non c'e' verdetto: il valore storico"
+          " %.0f a 720x480 non e' piu' applicato."
+          % (SSIM_MAX, SHARPNESS_MIN_STORICA))
 
 
 # --- modo batch ---------------------------------------------------------------
