@@ -17,6 +17,7 @@ synthetic_data_pipeline/sam3_1/sam3/
 test_images/
 PIANO_Dati_Sintetici_OR4.1.MD
 **/CARLA/outputs/
+/claude
 # --- locale alla workstation, fuori dal repo -------------------------------
 # Su Git va cio' che gira sul pod, piu' il verbale delle fasi chiuse. Questi
 # provano che un ambiente locale funziona: sul pod la stessa cosa la fa
@@ -27,3 +28,13 @@ synthetic_data_pipeline/wan2_2/night_run.py
 
 # Documenti di progetto: vivono in OR4.1/, non nel repo (come il gemello sopra)
 PIANO_ATTACCO_OR4.1.md
+
+# I report non vanno su GitHub: la versione da consegnare la monta l'autore a
+# parte, e un .md a meta' strada nel repo diventa subito la copia sbagliata che
+# qualcuno legge. Nel repo restano gli script che i numeri li producono.
+REPORT_*.md
+
+# --- strumentazione locale di Claude Code, fuori dal repo ------------------
+# ECC, hook, log e stato di sessione: riguardano come lavoro io su questa
+# macchina, non il progetto. Chi clona la repo non ne ha bisogno.
+.claude/
