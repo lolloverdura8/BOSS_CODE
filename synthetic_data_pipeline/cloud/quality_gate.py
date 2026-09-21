@@ -25,12 +25,22 @@
 #                 vicina a 1 ed e' inutile come dato di addestramento perche' non
 #                 contiene movimento.
 #
+# COME SI USA
+#
+#   una clip, alla sua risoluzione nativa (e' la chiamata storica):
+#     python quality_gate.py --clip out/wan22_5b/monopattino_00.mp4
+#
+#   tutte le clip di tutti i modelli, normalizzate e confrontabili fra loro:
+#     python quality_gate.py --clips-dir scaricato/out --out-dir eval
+#
 # Dipende solo da opencv-python e numpy. E' un vincolo, non un caso: questo file
 # va installato sul pod, e ogni dipendenza in piu' e' tempo di GPU fatturato
 # mentre pip risolve. SSIM e' quindi implementata qui invece di importare
 # scikit-image.
 import argparse
 import csv
+import glob
+import json
 import os
 from datetime import datetime
 
@@ -38,9 +48,12 @@ import cv2
 import numpy as np
 
 # Soglie calibrate con --calibrate. Valgono per la risoluzione a cui sono state
-# misurate: la varianza del Laplaciano dipende dalla scala - gli stessi frame
-# CARLA danno mediana 4736 a 1008x756 e 2150 a 720x480 - quindi ricalibrare
+# misurate: la varianza del Laplaciano dipende dalla scala, quindi ricalibrare
 # quando cambia la risoluzione di generazione.
+#
+# CALIBRATION_RESOLUTION non e' piu' passata a nessuna chiamata: da quando
+# --calibrate ragiona per altezza, resta qui solo a dichiarare a che risoluzione
+# fu misurata la SHARPNESS_MIN qui sotto, che invece e' viva e la usa runner.py.
 CALIBRATION_RESOLUTION = (720, 480)
 
 # Calibrata: i frame rovinati arrivano al massimo a 161, i buoni peggiori stanno
@@ -55,7 +68,59 @@ SHARPNESS_MIN = 370.0
 # non ferma. A 0,83 si scarterebbero clip legittime con poco movimento; 0,95
 # resta ben sotto i negativi misurati e lascia margine al caso vero.
 # Da rivedere quando esisteranno clip generate davvero difettose da misurare.
+#
+# QUESTA SOGLIA SOPRAVVIVE ALLA RINUNCIA A TUTTE LE ALTRE, e la ragione non e'
+# storica. Il suo negativo non ha bisogno di una popolazione di riferimento
+# esterna: si fabbrica dalla clip stessa, duplicandone i fotogrammi. Il difetto
+# "clip congelata" e' definito per confronto della clip con se' stessa, quindi
+# misurabile senza niente d'altro. La nitidezza no, e infatti li' la soglia ad
+# altezza normalizzata non c'e'.
+#
+# Verificata il 20/09/2026 ad altezza 704: i fotogrammi duplicati stanno sopra
+# 0,9988, quelli della clip vera arrivano al massimo a 0,8394. La SSIM inoltre
+# e' normalizzata e cambia poco con la risoluzione - misurato fra 0,794 e 0,819
+# su quattro altezze diverse della stessa clip - quindi una soglia sola vale a
+# qualunque altezza di valutazione.
 SSIM_MAX = 0.95
+
+# Altezza a cui si normalizza per confrontare modelli diversi. Le clip del
+# bake-off stanno fra 1280x704 e 1360x768: 704 e' la minima fra le altezze
+# native, quindi portare tutto li' preservando l'aspect ratio e' l'unica scelta
+# in cui NIENTE viene ingrandito - ogni clip subisce al massimo una riduzione di
+# fattore 0,92. Ingrandire non aggiunge dettaglio ma aggiunge interpolazione, che
+# la varianza del Laplaciano legge come sfocatura.
+#
+# Che la normalizzazione serva davvero e' misurato, non supposto: la stessa clip
+# (monopattino_00, 20/09/2026) da' nitidezza 645,6 a 704 di altezza, 468,7 a 576,
+# 621,7 a 480 e 1209,9 a 352. Varia di 2,6 volte, e per giunta NON in modo
+# monotono - la riduzione toglie dettaglio fine ma concentra i contorni su meno
+# pixel, e i due effetti si invertono. Due modelli misurati ad altezze diverse
+# non sono confrontabili, e non si puo' nemmeno correggere a mente il verso
+# dell'errore. La SSIM invece resta fra 0,794 e 0,819 sulle stesse quattro
+# altezze: e' normalizzata, e non ha bisogno di questa cautela.
+NORMALIZED_HEIGHT = 704
+
+# NESSUNA SOGLIA AD ALTEZZA NORMALIZZATA, ED E' UNA SCELTA.
+#
+# Una soglia si ricava confrontando due popolazioni: immagini sicuramente buone
+# e le stesse immagini rovinate di proposito. Le uniche immagini sicuramente
+# buone disponibili erano i render del simulatore, che il progetto ha deciso di
+# non usare come riferimento. Senza una popolazione di confronto la soglia
+# sarebbe arbitraria, e un verdetto arbitrario e' peggio di nessun verdetto.
+#
+# Il gate ad altezza normalizzata produce quindi solo valori grezzi. Servono a
+# confrontare i modelli FRA LORO, che e' la domanda del bake-off; non dicono se
+# una clip sia buona in assoluto, che e' una domanda a cui qui non si risponde.
+SHARPNESS_MIN_NORMALIZED = None
+
+# Passo temporale di riferimento per la SSIM confrontabile fra modelli, in
+# secondi. Gli fps nativi vanno da 8 (CogVideoX) a 24 (Wan, LTX, Hunyuan): fra
+# due frame consecutivi passa il triplo del tempo a 8 fps che a 24, quindi la
+# SSIM consecutiva misura anche gli fps, non solo il movimento. A 1/8 s lo scarto
+# in frame e' intero per tutti - 3 a 24 fps, 2 a 16, 1 a 8 - e nessuna clip va
+# interpolata. E' il passo nativo del modello piu' lento: piu' corto di cosi'
+# non si puo' andare senza inventare frame.
+REFERENCE_DT = 0.125
 
 # Parametri SSIM standard (Wang et al.): finestra gaussiana 11x11, sigma 1,5.
 SSIM_WIN, SSIM_SIGMA = 11, 1.5
@@ -86,7 +151,21 @@ def ssim(a, b):
     return float((num / den).mean())
 
 
-def read_video_gray(path):
+def fit_height(gray, h):
+    """Porta il frame ad altezza h preservando l'aspect ratio.
+
+    NON ingrandisce mai: se il frame e' gia' piu' basso di h lo restituisce
+    intatto. Un ingrandimento non aggiunge dettaglio ma aggiunge interpolazione,
+    e la varianza del Laplaciano lo legge come sfocatura - falserebbe verso il
+    basso proprio la popolazione che deve fare da riferimento.
+    """
+    if h is None or gray.shape[0] <= h:
+        return gray
+    w = int(round(gray.shape[1] * h / float(gray.shape[0])))
+    return cv2.resize(gray, (w, h), interpolation=cv2.INTER_AREA)
+
+
+def read_video_gray(path, target_height=None):
     """I frame di un video in scala di grigi. Lista vuota se non apribile."""
     cap = cv2.VideoCapture(path)
     frames = []
@@ -94,18 +173,32 @@ def read_video_gray(path):
         ok, frame = cap.read()
         if not ok:
             break
-        frames.append(to_gray(frame))
+        frames.append(fit_height(to_gray(frame), target_height))
     cap.release()
     return frames
 
 
-def evaluate_clip(path):
-    """Verdetto su una clip. E' la funzione che run_batch.py importera' sul pod.
+def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT):
+    """Verdetto su una clip. E' la funzione che runner.py chiama sul pod.
 
     Restituisce sempre un dizionario, anche in caso di errore: sul pod un gate
     che solleva eccezioni fermerebbe il lotto invece di scartare una clip.
+
+    I DUE PARAMETRI NUOVI SONO OPZIONALI E INERTI SE NON PASSATI. runner.py
+    chiama evaluate_clip(path) con un argomento solo, e con quella chiamata le
+    chiavi restituite e i loro valori sono identici a prima: le chiavi in piu'
+    compaiono solo se si chiede la normalizzazione.
+
+      target_height  altezza a cui portare i frame prima di misurare, aspect
+                     ratio preservato. Serve a confrontare modelli che generano
+                     a risoluzioni diverse: la varianza del Laplaciano scala con
+                     la risoluzione, quindi senza questo i numeri di due modelli
+                     non stanno sulla stessa scala.
+      fps            fotogrammi al secondo NATIVI della clip. Se dato, si calcola
+                     anche ssim_dt_median, cioe' la SSIM fra frame distanti
+                     ref_dt secondi invece che un fotogramma.
     """
-    frames = read_video_gray(path)
+    frames = read_video_gray(path, target_height)
     if len(frames) < 2:
         return {"path": path, "n_frames": len(frames), "verdict": "illeggibile",
                 "sharpness_median": None, "ssim_median": None, "reason":
@@ -117,37 +210,94 @@ def evaluate_clip(path):
     sharp_med = float(np.median(sharp))
     ssim_med = float(np.median(sims))
 
+    # La soglia di nitidezza vale solo alla risoluzione a cui e' stata calibrata.
+    # Normalizzando si cambia scala, quindi serve l'altra soglia; se non e'
+    # ancora stata ricavata si dichiara "non calibrato" invece di dare un
+    # verdetto con la soglia sbagliata.
+    if target_height is None:
+        soglia_nitidezza, dove = SHARPNESS_MIN, None
+    else:
+        soglia_nitidezza, dove = SHARPNESS_MIN_NORMALIZED, "h=%d" % target_height
+
     reasons = []
-    if sharp_med < SHARPNESS_MIN:
-        reasons.append("sfocata (nitidezza %.0f < %.0f)" % (sharp_med, SHARPNESS_MIN))
+    if soglia_nitidezza is not None and sharp_med < soglia_nitidezza:
+        if dove is None:
+            # Parola per parola il testo di prima. Finisce in gate_note dentro
+            # manifest.jsonl, che e' un file in append: due formati diversi nello
+            # stesso file, a seconda di quando la clip e' stata generata, sono
+            # rumore che qualcuno un giorno dovrebbe spiegarsi.
+            reasons.append("sfocata (nitidezza %.0f < %.0f)"
+                           % (sharp_med, soglia_nitidezza))
+        else:
+            reasons.append("sfocata (nitidezza %.0f < %.0f a %s)"
+                           % (sharp_med, soglia_nitidezza, dove))
+    # La SSIM si controlla sui frame CONSECUTIVI anche quando si conosce ref_dt:
+    # ssim_dt e' sempre <= ssim consecutiva, perche' fra i due frame passa piu'
+    # tempo, quindi la consecutiva e' il test conservativo per il difetto che
+    # questa soglia intercetta, cioe' la clip congelata.
     if ssim_med > SSIM_MAX:
         reasons.append("statica (SSIM %.3f > %.3f)" % (ssim_med, SSIM_MAX))
 
-    return {
+    out = {
         "path": path,
         "n_frames": len(frames),
         "sharpness_median": round(sharp_med, 1),
         "sharpness_min": round(float(np.min(sharp)), 1),
         "ssim_median": round(ssim_med, 4),
         "ssim_max": round(float(np.max(sims)), 4),
-        "verdict": "scarta" if reasons else "tieni",
+        # Tre esiti e non due: senza soglia di nitidezza non si puo' dire
+        # "tieni", ma una clip congelata resta riconoscibile lo stesso, perche'
+        # quel criterio una soglia ce l'ha.
+        "verdict": ("scarta" if reasons
+                    else ("solo valori grezzi" if soglia_nitidezza is None
+                          else "tieni")),
         "reason": "; ".join(reasons),
     }
+
+    if target_height is not None:
+        out["altezza_valutata"] = frames[0].shape[0]
+        out["larghezza_valutata"] = frames[0].shape[1]
+
+    if fps:
+        step = max(1, int(round(fps * ref_dt)))
+        sims_dt = [ssim(frames[i - step], frames[i])
+                   for i in range(step, len(frames))]
+        out["ssim_dt_median"] = round(float(np.median(sims_dt)), 4) if sims_dt else None
+        out["ssim_dt_step"] = step
+        out["ssim_dt_s"] = round(step / float(fps), 4)
+
+    return out
 
 
 # --- calibrazione -------------------------------------------------------------
 
-def load_good_frames(directory, size, limit):
-    """Frame sicuramente buoni: render CARLA, portati alla risoluzione bersaglio."""
+def load_good_frames(directory, target_height, limit):
+    """Frame sicuramente buoni, portati all'altezza bersaglio.
+
+    Restituisce DUE popolazioni, e la distinzione non e' un dettaglio:
+
+      sparsi   campionati a passo largo lungo tutta la sequenza, per la
+               nitidezza.
+               Serve varieta' di scene, e due frame adiacenti sono quasi la
+               stessa immagine.
+      contigui una corsa di frame consecutivi, per la SSIM. La SSIM misura
+               quanto cambia la scena da un fotogramma al successivo: calcolarla
+               su frame campionati a passo 7, come faceva la versione
+               precedente, misura il movimento di 7 fotogrammi e fa sembrare la
+               popolazione buona molto piu' mobile di quanto sia.
+    """
     names = sorted(n for n in os.listdir(directory) if n.lower().endswith((".png", ".jpg")))
+
+    def leggi(selezione):
+        out = []
+        for name in selezione:
+            img = cv2.imread(os.path.join(directory, name))
+            if img is not None:
+                out.append(fit_height(to_gray(img), target_height))
+        return out
+
     step = max(1, len(names) // limit)
-    out = []
-    for name in names[::step][:limit]:
-        img = cv2.imread(os.path.join(directory, name))
-        if img is None:
-            continue
-        out.append(to_gray(cv2.resize(img, size, interpolation=cv2.INTER_AREA)))
-    return out
+    return leggi(names[::step][:limit]), leggi(names[:limit])
 
 
 def degrade(frames):
@@ -185,14 +335,19 @@ def gap(low_population, high_population):
     return float(np.sqrt(hi * lo)), hi, lo
 
 
-def calibrate(good_dir, clip_path, size, limit, out_dir):
-    print("risoluzione di calibrazione: %dx%d" % size)
-    good = load_good_frames(good_dir, size, limit)
+def calibrate(good_dir, clip_path, target_height, limit, out_dir):
+    print("altezza di calibrazione: %s"
+          % (target_height or "nativa, nessuna normalizzazione"))
+    good, good_contigui = load_good_frames(good_dir, target_height, limit)
     if not good:
         raise SystemExit("nessun frame leggibile in %s" % good_dir)
-    clip = read_video_gray(clip_path)
-    print("frame buoni (render):  %d da %s" % (len(good), good_dir))
-    print("frame generati:        %d da %s" % (len(clip), clip_path))
+    clip = read_video_gray(clip_path, target_height)
+    if not clip:
+        raise SystemExit("clip non leggibile: %s" % clip_path)
+    print("frame buoni (render):  %d da %s  (%dx%d)"
+          % (len(good), good_dir, good[0].shape[1], good[0].shape[0]))
+    print("frame generati:        %d da %s  (%dx%d)"
+          % (len(clip), clip_path, clip[0].shape[1], clip[0].shape[0]))
 
     rows = []
 
@@ -213,7 +368,8 @@ def calibrate(good_dir, clip_path, size, limit, out_dir):
         record("rovinati", name, v, "nitidezza")
 
     good_ssim = [ssim(clip[i - 1], clip[i]) for i in range(1, len(clip))]
-    good_ssim += [ssim(good[i - 1], good[i]) for i in range(1, len(good))]
+    good_ssim += [ssim(good_contigui[i - 1], good_contigui[i])
+                  for i in range(1, len(good_contigui))]
     record("buoni", "frame consecutivi", good_ssim, "ssim")
 
     # Il negativo per la SSIM e' la clip congelata: frame identici, e frame quasi
@@ -263,8 +419,117 @@ def calibrate(good_dir, clip_path, size, limit, out_dir):
         print("  SOGLIA SUPERIORE proposta: %.4f" % thr_ssim)
 
     print("\ndistribuzioni: %s" % path)
-    print("soglie attualmente nel codice: nitidezza >= %.0f, SSIM <= %.4f"
-          % (SHARPNESS_MIN, SSIM_MAX))
+    print("soglie attualmente nel codice: nitidezza >= %.0f a 720x480, %s ad"
+          " altezza %d; SSIM <= %.4f"
+          % (SHARPNESS_MIN,
+             "NON ANCORA CALIBRATA" if SHARPNESS_MIN_NORMALIZED is None
+             else "%.0f" % SHARPNESS_MIN_NORMALIZED,
+             NORMALIZED_HEIGHT, SSIM_MAX))
+
+
+# --- modo batch ---------------------------------------------------------------
+
+CSV_COLONNE = ["modello", "clip_id", "n_frames", "fps", "risoluzione_nativa",
+               "altezza_valutata", "larghezza_valutata", "sharpness_median",
+               "sharpness_min", "ssim_median", "ssim_max", "ssim_dt_median",
+               "ssim_dt_step", "ssim_dt_s", "verdict", "reason", "path"]
+
+
+def leggi_specs(clips_dir):
+    """clip_id -> specifiche native, dal manifest accanto alle clip.
+
+    Gli fps e la risoluzione NON si indovinano dal file video: il contenitore
+    mp4 riporta quello che ci ha scritto l'encoder, mentre qui serve il dato
+    nativo del modello, che e' l'unico a dire quanto tempo separa davvero due
+    fotogrammi. Sta nel manifest, scritto da runner.py al momento della
+    generazione.
+
+    Regge due forme: adapter_spec annidato (runner.py) e campi in cima
+    (manifest della clip locale dell'11/09, che l'adapter non l'aveva ancora).
+    L'ultima riga vince, come in compare_models.read_manifest: un rilancio dopo
+    un OOM riscrive l'esito.
+    """
+    path = os.path.join(clips_dir, "manifest.jsonl")
+    specs = {}
+    if not os.path.exists(path):
+        return specs
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            # Il manifest si scrive in append durante la generazione: se quel
+            # processo viene ucciso a meta' riga - watchdog, OOM, pod revocato -
+            # l'ultima riga resta JSON parziale. Farla propagare fermerebbe la
+            # valutazione anche dei modelli che vengono dopo in ordine
+            # alfabetico, e la loro colpa sarebbe di chiamarsi in un certo modo.
+            try:
+                r = json.loads(line)
+            except ValueError as e:
+                print("  manifest %s riga %d illeggibile, saltata: %s"
+                      % (path, n, e))
+                continue
+            spec = r.get("adapter_spec") or r
+            specs[r.get("clip_id")] = {
+                "fps": spec.get("fps"),
+                "height": spec.get("height"),
+                "width": spec.get("width"),
+            }
+    return specs
+
+
+def cartelle_modello(root):
+    """Le cartelle da valutare: root stessa se contiene clip, altrimenti le sue
+    sottocartelle. Cosi' un solo comando copre tutti i modelli del bake-off."""
+    if glob.glob(os.path.join(root, "*.mp4")):
+        return [root]
+    return [d for d in sorted(glob.glob(os.path.join(root, "*")))
+            if os.path.isdir(d) and glob.glob(os.path.join(d, "*.mp4"))]
+
+
+def run_batch(root, target_height, ref_dt, out_dir):
+    cartelle = cartelle_modello(root)
+    if not cartelle:
+        raise SystemExit("nessuna clip trovata sotto %s" % root)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for cartella in cartelle:
+        modello = os.path.basename(os.path.normpath(cartella))
+        specs = leggi_specs(cartella)
+        clips = [c for c in sorted(glob.glob(os.path.join(cartella, "*.mp4")))
+                 if not c.endswith(".tmp.mp4")]
+        print("")
+        print("%s: %d clip, %d voci nel manifest"
+              % (modello, len(clips), len(specs)))
+
+        righe = []
+        for clip in clips:
+            clip_id = os.path.splitext(os.path.basename(clip))[0]
+            spec = specs.get(clip_id, {})
+            r = evaluate_clip(clip, target_height=target_height,
+                              fps=spec.get("fps"), ref_dt=ref_dt)
+            r["modello"] = modello
+            r["clip_id"] = clip_id
+            r["fps"] = spec.get("fps")
+            r["risoluzione_nativa"] = ("%sx%s" % (spec.get("width"), spec.get("height"))
+                                       if spec.get("width") else None)
+            if not spec.get("fps"):
+                r["reason"] = ((r.get("reason") or "") +
+                               "; fps assente dal manifest: SSIM a passo fisso non"
+                               " calcolata").strip("; ")
+            righe.append(r)
+            print("  %-24s nitidezza %8s  SSIM %7s  SSIM dt %7s  %s"
+                  % (clip_id, r.get("sharpness_median"), r.get("ssim_median"),
+                     r.get("ssim_dt_median", "-"), r.get("verdict")))
+
+        destinazione = os.path.join(out_dir, modello)
+        os.makedirs(destinazione, exist_ok=True)
+        csv_path = os.path.join(destinazione, "gate_generated_%s.csv" % ts)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_COLONNE, extrasaction="ignore",
+                               restval="")
+            w.writeheader()
+            w.writerows(righe)
+        print("  -> %s" % csv_path)
 
 
 def main():
@@ -273,22 +538,52 @@ def main():
     parser.add_argument("--calibrate", action="store_true",
                         help="ricava le soglie confrontando buoni e rovinati")
     parser.add_argument("--good", default=None,
-                        help="cartella di frame sicuramente buoni (render CARLA)")
+                        help="cartella di frame sicuramente buoni")
     parser.add_argument("--clip", default=None, help="una clip generata")
+    parser.add_argument("--clips-dir", default=None,
+                        help="cartella di un modello (o la radice di out/): valuta"
+                             " tutte le clip e scrive un CSV per modello")
+    parser.add_argument("--target-height", type=int, default=None,
+                        help="altezza a cui normalizzare prima di misurare, aspect"
+                             " ratio preservato. 0 = risoluzione nativa. Default:"
+                             " %d in modo batch e in calibrazione, nativa con --clip"
+                             % NORMALIZED_HEIGHT)
+    parser.add_argument("--ref-dt", type=float, default=REFERENCE_DT,
+                        help="secondi fra i due frame della SSIM confrontabile")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="fps nativi, per la SSIM a passo fisso con --clip"
+                             " (in modo batch si leggono dal manifest)")
     parser.add_argument("--limit", type=int, default=40,
                         help="quanti frame buoni campionare")
     parser.add_argument("--out-dir", default="outputs")
     args = parser.parse_args()
 
+    # Il default dipende dal modo: --clip da solo deve continuare a comportarsi
+    # come prima, cioe' misurare alla risoluzione nativa, perche' e' la chiamata
+    # con cui sono stati prodotti i valori storici. Batch e calibrazione invece
+    # esistono per confrontare, e senza normalizzazione il confronto non sta in
+    # piedi.
+    def altezza(default):
+        if args.target_height is None:
+            return default
+        return args.target_height or None
+
     if args.calibrate:
         if not args.good or not args.clip:
             raise SystemExit("--calibrate richiede --good e --clip")
-        calibrate(args.good, args.clip, CALIBRATION_RESOLUTION, args.limit, args.out_dir)
+        calibrate(args.good, args.clip, altezza(NORMALIZED_HEIGHT), args.limit,
+                  args.out_dir)
+        return
+
+    if args.clips_dir:
+        run_batch(args.clips_dir, altezza(NORMALIZED_HEIGHT), args.ref_dt,
+                  args.out_dir)
         return
 
     if not args.clip:
-        raise SystemExit("indicare --clip da valutare, oppure --calibrate")
-    result = evaluate_clip(args.clip)
+        raise SystemExit("indicare --clip o --clips-dir da valutare, oppure --calibrate")
+    result = evaluate_clip(args.clip, target_height=altezza(None), fps=args.fps,
+                           ref_dt=args.ref_dt)
     for k, v in result.items():
         print("%-18s %s" % (k + ":", v))
 

@@ -82,7 +82,7 @@ def newest(pattern):
     return hits[-1] if hits else None
 
 
-def metrics(manifest, sam_rows, da3_rows, usd_per_hour):
+def metrics(manifest, sam_rows, da3_rows, usd_per_hour, gate_rows=None):
     m = {}
 
     # --- M1, M2, M3 ---------------------------------------------------------
@@ -130,8 +130,47 @@ def metrics(manifest, sam_rows, da3_rows, usd_per_hour):
     m["n_clip_errore"] = sum(1 for r in manifest if r.get("esito") == "errore")
     tempi = [r["tempo_s"] for r in ok if r.get("tempo_s")]
     m["m7_s_per_clip"] = st.mean(tempi) if tempi else None
-    sharp = [r["gate_sharpness"] for r in ok if r.get("gate_sharpness") is not None]
-    ssim = [r["gate_ssim"] for r in ok if r.get("gate_ssim") is not None]
+
+    # M5 ha due fonti possibili, e quale sia cambia cosa significa il numero.
+    #
+    #   il CSV del gate   valori ricalcolati ad altezza normalizzata: la varianza
+    #                     del Laplaciano cambia con la risoluzione a cui e'
+    #                     calcolata, quindi solo questi sono confrontabili fra
+    #                     modelli che generano a risoluzioni diverse. Porta anche
+    #                     la SSIM a passo temporale fisso.
+    #   il manifest       valori grezzi alla risoluzione nativa, scritti da
+    #                     run_gate() al momento della generazione. Confrontabili
+    #                     con lo storico, NON fra modelli.
+    #
+    # Si preferisce il CSV quando c'e'; il manifest resta la rete, cosi' un
+    # modello senza gate rigirato non sparisce dalla tabella.
+    gate_rows = gate_rows or []
+    if gate_rows:
+        sharp = [num(r.get("sharpness_median")) for r in gate_rows]
+        ssim = [num(r.get("ssim_median")) for r in gate_rows]
+        ssim_dt = [num(r.get("ssim_dt_median")) for r in gate_rows]
+        m["m5_fonte"] = "gate normalizzato"
+        alt = {r.get("altezza_valutata") for r in gate_rows if r.get("altezza_valutata")}
+        m["m5_altezza_valutata"] = alt.pop() if len(alt) == 1 else None
+        dt = [x for x in ssim_dt if x is not None]
+        m["m5_ssim_dt_med"] = st.median(dt) if dt else None
+        m["m5_scartate_dal_gate"] = sum(1 for r in gate_rows
+                                        if r.get("verdict") == "scarta")
+    else:
+        sharp = [r["gate_sharpness"] for r in ok if r.get("gate_sharpness") is not None]
+        ssim = [r["gate_ssim"] for r in ok if r.get("gate_ssim") is not None]
+        m["m5_fonte"] = "manifest, risoluzione nativa"
+        m["m5_altezza_valutata"] = None
+        m["m5_ssim_dt_med"] = None
+        m["m5_scartate_dal_gate"] = None
+    sharp = [x for x in sharp if x is not None]
+    ssim = [x for x in ssim if x is not None]
+    # UNA DEFINIZIONE SOLA, in entrambi i rami: le clip con un valore di
+    # nitidezza utilizzabile. Contare invece le righe del CSV includerebbe anche
+    # le clip illeggibili, e un modello sembrerebbe avere piu' campioni di
+    # un altro solo per aver fallito di piu'. Finisce in --json-out, che e'
+    # l'output su cui si fanno i confronti fini.
+    m["n_clip_gate"] = len(sharp)
     m["m5_sharpness_med"] = st.median(sharp) if sharp else None
     m["m5_ssim_med"] = st.median(ssim) if ssim else None
 
@@ -194,6 +233,7 @@ def render(results, usd_per_hour):
         ("M4 r med", "%9s", lambda k, m: fmt(m["m4_r_med"], "%.3f")),
         ("M5 nit.", "%8s", lambda k, m: fmt(m["m5_sharpness_med"], "%.0f")),
         ("M5 SSIM", "%8s", lambda k, m: fmt(m["m5_ssim_med"], "%.3f")),
+        ("M5 SSIMdt", "%10s", lambda k, m: fmt(m.get("m5_ssim_dt_med"), "%.3f")),
         ("M6 cv", "%7s", lambda k, m: fmt(m["m6_cv_area_med"], "%.3f")),
         ("ist/clip", "%9s", lambda k, m: fmt(m["istanze_utili_per_clip"], "%.2f")),
         ("$/ist.", "%8s", lambda k, m: fmt(m["usd_per_istanza_utile"], "%.4f")),
@@ -212,6 +252,17 @@ def render(results, usd_per_hour):
               " media fra hardware diversi e NON vanno confrontati con gli altri"
               " modelli. Rigenerare sulla stessa GPU prima di trarre conclusioni."
               % ", ".join(miste))
+
+    nativi = [k for k, m in results.items()
+              if m.get("m5_fonte") == "manifest, risoluzione nativa"]
+    if nativi:
+        print("")
+        print("!!! %s: M5 viene dal manifest, cioe' dalla risoluzione NATIVA di ogni"
+              " modello. La varianza del Laplaciano cambia con la risoluzione a cui"
+              " e' calcolata - misurato 2,6 volte sulla stessa clip, e non in modo"
+              " monotono - quindi quelle nitidezze non si confrontano fra righe."
+              " Rigirare quality_gate.py --clips-dir per averle normalizzate."
+              % ", ".join(nativi))
 
     print("\nRiferimento M1: %.1f%% (bicicletta CARLA in modalita' testo, B.1-B.4)."
           % RIFERIMENTO_SAM_CARLA)
@@ -234,7 +285,8 @@ def discover(root, eval_root):
         ev = os.path.join(eval_root, name)
         out.append((name, manifest,
                     newest(os.path.join(ev, "sam_generated_*.csv")),
-                    newest(os.path.join(ev, "da3_generated_*.csv"))))
+                    newest(os.path.join(ev, "da3_generated_*.csv")),
+                    newest(os.path.join(ev, "gate_generated_*.csv"))))
     return out
 
 
@@ -248,20 +300,34 @@ def main():
     parser.add_argument("--json-out", default=None, help="scrive anche le metriche grezze")
     args = parser.parse_args()
 
-    entries = list(args.add or [])
+    # --add porta tre file espliciti; il quarto, il CSV del gate, lo trova solo
+    # discover(). Si completa con None per tenere una forma sola.
+    entries = [tuple(a) + (None,) for a in (args.add or [])]
     if args.root:
         entries += discover(args.root, args.eval_root or args.root)
     if not entries:
         parser.error("serve --root oppure almeno un --add")
 
+    def leggi(path):
+        return read_csv(path) if path and os.path.exists(path) else []
+
     results = {}
-    for name, manifest, sam_csv, da3_csv in entries:
-        if not (sam_csv and da3_csv and os.path.exists(sam_csv) and os.path.exists(da3_csv)):
-            print("%s: CSV di SAM o DA3 mancanti, saltato" % name)
-            continue
-        results[name] = metrics(read_manifest(manifest), read_csv(sam_csv),
-                                read_csv(da3_csv), args.usd_per_hour)
-        results[name]["_files"] = {"manifest": manifest, "sam": sam_csv, "da3": da3_csv}
+    for name, manifest, sam_csv, da3_csv, gate_csv in entries:
+        sam_rows, da3_rows = leggi(sam_csv), leggi(da3_csv)
+        gate_rows = leggi(gate_csv)
+        # UN MODELLO SENZA SAM E DA3 NON SI SALTA PIU'. Le sue M1-M4 e M6 restano
+        # vuote - metrics() ha una guardia per ognuna - ma M5 e M7 esistono lo
+        # stesso, e sono esattamente le due colonne che servono per confrontare
+        # la qualita' dei pixel e il costo. Saltare la riga nascondeva dati che
+        # c'erano gia' nel manifest.
+        mancanti = [n for n, r in (("SAM", sam_rows), ("DA3", da3_rows)) if not r]
+        if mancanti:
+            print("%s: senza CSV di %s, in tabella solo M5 e M7"
+                  % (name, " e ".join(mancanti)))
+        results[name] = metrics(read_manifest(manifest), sam_rows, da3_rows,
+                                args.usd_per_hour, gate_rows)
+        results[name]["_files"] = {"manifest": manifest, "sam": sam_csv,
+                                   "da3": da3_csv, "gate": gate_csv}
 
     if not results:
         parser.error("nessun modello con dati completi")
