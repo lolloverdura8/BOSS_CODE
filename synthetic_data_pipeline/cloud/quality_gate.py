@@ -122,6 +122,25 @@ SHARPNESS_MIN_NORMALIZED = None
 # non si puo' andare senza inventare frame.
 REFERENCE_DT = 0.125
 
+# Ritaglio centrale: il modo di confrontare la nitidezza SENZA interpolare.
+#
+# Misurato il 21/09/2026 sulla clip wan22_5b, nativa 1280x704: ridurla a 700 di
+# altezza, cioe' dello 0,6 per cento, porta la nitidezza da 1133,4 a 602,1. Meno
+# della meta'. E a 640 risale a 706,4, quindi non e' la perdita di dettaglio: e'
+# l'interpolazione in se' che smussa i contorni e paga un prezzo fisso appena la
+# si tocca. Conseguenza: un ridimensionamento "normalizzante" regala il valore
+# pieno ai modelli gia' nati all'altezza bersaglio e taglia del 25-47 per cento
+# tutti gli altri, che e' un confondimento piu' grande di quello che curava.
+#
+# 1280x704 e' il rettangolo piu' grande che entra in tutte le risoluzioni native
+# del bake-off (1280x704, 1280x720, 1360x768). Il ritaglio non interpola: i pixel
+# sono gli originali, alla loro scala, e sono lo stesso numero per ogni modello.
+# Per chi e' gia' 1280x704 il ritaglio e' l'identita', e qui va bene - a
+# differenza del ridimensionamento, ritagliare non introduce nessun artefatto,
+# quindi identita' e ritaglio sono la stessa misura e non due trattamenti
+# diversi.
+CROP_SIZE = (1280, 704)
+
 # Parametri SSIM standard (Wang et al.): finestra gaussiana 11x11, sigma 1,5.
 SSIM_WIN, SSIM_SIGMA = 11, 1.5
 SSIM_C1, SSIM_C2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
@@ -165,7 +184,24 @@ def fit_height(gray, h):
     return cv2.resize(gray, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def read_video_gray(path, target_height=None):
+def center_crop(gray, size):
+    """Ritaglio centrale a dimensione fissa. Non interpola e non ridimensiona.
+
+    Se il frame e' piu' piccolo del bersaglio lo restituisce intatto: allargarlo
+    vorrebbe dire inventare pixel, che e' il difetto da cui questa funzione
+    esiste per scappare.
+    """
+    if size is None:
+        return gray
+    w, h = size
+    H, W = gray.shape[:2]
+    if W < w or H < h:
+        return gray
+    x, y = (W - w) // 2, (H - h) // 2
+    return gray[y:y + h, x:x + w]
+
+
+def read_video_gray(path, target_height=None, crop=None):
     """I frame di un video in scala di grigi. Lista vuota se non apribile."""
     cap = cv2.VideoCapture(path)
     frames = []
@@ -173,12 +209,26 @@ def read_video_gray(path, target_height=None):
         ok, frame = cap.read()
         if not ok:
             break
-        frames.append(fit_height(to_gray(frame), target_height))
+        frames.append(center_crop(fit_height(to_gray(frame), target_height), crop))
     cap.release()
     return frames
 
 
-def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT):
+def sharpness_only(path, target_height=None, crop=None):
+    """La sola nitidezza mediana, per le passate di confronto.
+
+    Esiste per non ricalcolare la SSIM, che e' il pezzo caro: una gaussiana per
+    ogni coppia di fotogrammi. Le colonne "ridimensionata" e "ritaglio" servono a
+    confrontare la nitidezza, e la SSIM li' sarebbe scartata comunque.
+    """
+    frames = read_video_gray(path, target_height, crop)
+    if not frames:
+        return None, None
+    med = float(np.median([sharpness(f) for f in frames]))
+    return round(med, 1), "%dx%d" % (frames[0].shape[1], frames[0].shape[0])
+
+
+def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT, crop=None):
     """Verdetto su una clip. E' la funzione che runner.py chiama sul pod.
 
     Restituisce sempre un dizionario, anche in caso di errore: sul pod un gate
@@ -197,8 +247,11 @@ def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT):
       fps            fotogrammi al secondo NATIVI della clip. Se dato, si calcola
                      anche ssim_dt_median, cioe' la SSIM fra frame distanti
                      ref_dt secondi invece che un fotogramma.
+      crop           (larghezza, altezza) del ritaglio centrale. E' l'altro modo
+                     di mettere i modelli sulla stessa scala, e l'unico che non
+                     interpola: vedi CROP_SIZE.
     """
-    frames = read_video_gray(path, target_height)
+    frames = read_video_gray(path, target_height, crop)
     if len(frames) < 2:
         return {"path": path, "n_frames": len(frames), "verdict": "illeggibile",
                 "sharpness_median": None, "ssim_median": None, "reason":
@@ -254,7 +307,7 @@ def evaluate_clip(path, target_height=None, fps=None, ref_dt=REFERENCE_DT):
         "reason": "; ".join(reasons),
     }
 
-    if target_height is not None:
+    if target_height is not None or crop is not None:
         out["altezza_valutata"] = frames[0].shape[0]
         out["larghezza_valutata"] = frames[0].shape[1]
 
@@ -429,10 +482,23 @@ def calibrate(good_dir, clip_path, target_height, limit, out_dir):
 
 # --- modo batch ---------------------------------------------------------------
 
+# TRE COLONNE DI NITIDEZZA, E NON UNA, perche' misurano tre cose diverse e
+# nessuna delle tre e' quella giusta in assoluto:
+#
+#   nativa       i pixel come escono dal modello. Confrontabile solo nella misura
+#                in cui le risoluzioni si somigliano - qui stanno fra 0,90 e 1,04
+#                Mpx, cioe' un 16 per cento di scarto.
+#   ridimension. tutte alla stessa altezza. Mette d'accordo le risoluzioni ma
+#                interpola, e l'interpolazione da sola costa il 25-47 per cento
+#                (vedi CROP_SIZE): chi e' gia' all'altezza bersaglio non la paga.
+#   ritaglio     stesso numero di pixel originali per tutti, nessuna
+#                interpolazione. Il prezzo e' che si guarda una porzione di scena
+#                leggermente diversa da un modello all'altro.
 CSV_COLONNE = ["modello", "clip_id", "n_frames", "fps", "risoluzione_nativa",
-               "altezza_valutata", "larghezza_valutata", "sharpness_median",
-               "sharpness_min", "ssim_median", "ssim_max", "ssim_dt_median",
-               "ssim_dt_step", "ssim_dt_s", "verdict", "reason", "path"]
+               "nitidezza_nativa", "nitidezza_ridimensionata", "nitidezza_ritaglio",
+               "ridimensionata_a", "ritaglio_a", "nitidezza_min_nativa",
+               "ssim_median", "ssim_max", "ssim_dt_median", "ssim_dt_step",
+               "ssim_dt_s", "verdict", "reason", "path"]
 
 
 def leggi_specs(clips_dir):
@@ -486,7 +552,7 @@ def cartelle_modello(root):
             if os.path.isdir(d) and glob.glob(os.path.join(d, "*.mp4"))]
 
 
-def run_batch(root, target_height, ref_dt, out_dir):
+def run_batch(root, target_height, ref_dt, out_dir, crop=CROP_SIZE):
     cartelle = cartelle_modello(root)
     if not cartelle:
         raise SystemExit("nessuna clip trovata sotto %s" % root)
@@ -505,8 +571,21 @@ def run_batch(root, target_height, ref_dt, out_dir):
         for clip in clips:
             clip_id = os.path.splitext(os.path.basename(clip))[0]
             spec = specs.get(clip_id, {})
-            r = evaluate_clip(clip, target_height=target_height,
-                              fps=spec.get("fps"), ref_dt=ref_dt)
+            # La passata completa e' una sola, sui pixel nativi: e' da li' che
+            # vengono la SSIM e il verdetto, cosi' nessuna interpolazione entra
+            # nel criterio della clip congelata. Le altre due servono solo alla
+            # nitidezza.
+            nat = evaluate_clip(clip, fps=spec.get("fps"), ref_dt=ref_dt)
+            nit_riz, dim_riz = sharpness_only(clip, target_height=target_height)
+            nit_rit, dim_rit = sharpness_only(clip, crop=crop)
+
+            r = dict(nat)
+            r["nitidezza_nativa"] = nat.get("sharpness_median")
+            r["nitidezza_min_nativa"] = nat.get("sharpness_min")
+            r["nitidezza_ridimensionata"] = nit_riz
+            r["nitidezza_ritaglio"] = nit_rit
+            r["ridimensionata_a"] = dim_riz
+            r["ritaglio_a"] = dim_rit
             r["modello"] = modello
             r["clip_id"] = clip_id
             r["fps"] = spec.get("fps")
@@ -517,9 +596,11 @@ def run_batch(root, target_height, ref_dt, out_dir):
                                "; fps assente dal manifest: SSIM a passo fisso non"
                                " calcolata").strip("; ")
             righe.append(r)
-            print("  %-24s nitidezza %8s  SSIM %7s  SSIM dt %7s  %s"
-                  % (clip_id, r.get("sharpness_median"), r.get("ssim_median"),
-                     r.get("ssim_dt_median", "-"), r.get("verdict")))
+            print("  %-18s nit nat %8s  ridim %8s  ritaglio %8s |  SSIM %7s"
+                  "  SSIM dt %7s"
+                  % (clip_id, r.get("nitidezza_nativa"),
+                     r.get("nitidezza_ridimensionata"), r.get("nitidezza_ritaglio"),
+                     r.get("ssim_median"), r.get("ssim_dt_median", "-")))
 
         destinazione = os.path.join(out_dir, modello)
         os.makedirs(destinazione, exist_ok=True)
@@ -577,7 +658,7 @@ def main():
 
     if args.clips_dir:
         run_batch(args.clips_dir, altezza(NORMALIZED_HEIGHT), args.ref_dt,
-                  args.out_dir)
+                  args.out_dir, CROP_SIZE)
         return
 
     if not args.clip:

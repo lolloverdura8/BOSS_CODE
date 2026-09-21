@@ -144,24 +144,35 @@ def metrics(manifest, sam_rows, da3_rows, usd_per_hour, gate_rows=None):
     #
     # Si preferisce il CSV quando c'e'; il manifest resta la rete, cosi' un
     # modello senza gate rigirato non sparisce dalla tabella.
+    def mediana(valori):
+        valori = [v for v in valori if v is not None]
+        return st.median(valori) if valori else None
+
     gate_rows = gate_rows or []
     if gate_rows:
-        sharp = [num(r.get("sharpness_median")) for r in gate_rows]
+        sharp = [num(r.get("nitidezza_nativa")) for r in gate_rows]
         ssim = [num(r.get("ssim_median")) for r in gate_rows]
-        ssim_dt = [num(r.get("ssim_dt_median")) for r in gate_rows]
-        m["m5_fonte"] = "gate normalizzato"
-        alt = {r.get("altezza_valutata") for r in gate_rows if r.get("altezza_valutata")}
-        m["m5_altezza_valutata"] = alt.pop() if len(alt) == 1 else None
-        dt = [x for x in ssim_dt if x is not None]
-        m["m5_ssim_dt_med"] = st.median(dt) if dt else None
+        m["m5_fonte"] = "gate"
+        m["m5_nit_ridim"] = mediana([num(r.get("nitidezza_ridimensionata"))
+                                     for r in gate_rows])
+        m["m5_nit_ritaglio"] = mediana([num(r.get("nitidezza_ritaglio"))
+                                        for r in gate_rows])
+        m["m5_ssim_dt_med"] = mediana([num(r.get("ssim_dt_median"))
+                                       for r in gate_rows])
+        dim = {r.get("ritaglio_a") for r in gate_rows if r.get("ritaglio_a")}
+        m["m5_ritaglio_a"] = dim.pop() if len(dim) == 1 else None
         m["m5_scartate_dal_gate"] = sum(1 for r in gate_rows
                                         if r.get("verdict") == "scarta")
     else:
+        # Il manifest ha una sola nitidezza, quella nativa: run_gate la calcola
+        # al momento della generazione, quando le altre due non avrebbero senso.
         sharp = [r["gate_sharpness"] for r in ok if r.get("gate_sharpness") is not None]
         ssim = [r["gate_ssim"] for r in ok if r.get("gate_ssim") is not None]
-        m["m5_fonte"] = "manifest, risoluzione nativa"
-        m["m5_altezza_valutata"] = None
+        m["m5_fonte"] = "manifest"
+        m["m5_nit_ridim"] = None
+        m["m5_nit_ritaglio"] = None
         m["m5_ssim_dt_med"] = None
+        m["m5_ritaglio_a"] = None
         m["m5_scartate_dal_gate"] = None
     sharp = [x for x in sharp if x is not None]
     ssim = [x for x in ssim if x is not None]
@@ -171,7 +182,7 @@ def metrics(manifest, sam_rows, da3_rows, usd_per_hour, gate_rows=None):
     # un altro solo per aver fallito di piu'. Finisce in --json-out, che e'
     # l'output su cui si fanno i confronti fini.
     m["n_clip_gate"] = len(sharp)
-    m["m5_sharpness_med"] = st.median(sharp) if sharp else None
+    m["m5_nit_nativa"] = st.median(sharp) if sharp else None
     m["m5_ssim_med"] = st.median(ssim) if ssim else None
 
     picchi = [r["vram_alloc_peak_gb"] for r in ok if r.get("vram_alloc_peak_gb")]
@@ -231,7 +242,9 @@ def render(results, usd_per_hour):
         ("M3 sup%", "%8s", lambda k, m: fmt(m["m3_tasso_supporto"])),
         ("M4 coer%", "%9s", lambda k, m: fmt(m["m4_coerenza"])),
         ("M4 r med", "%9s", lambda k, m: fmt(m["m4_r_med"], "%.3f")),
-        ("M5 nit.", "%8s", lambda k, m: fmt(m["m5_sharpness_med"], "%.0f")),
+        ("M5 nat.", "%8s", lambda k, m: fmt(m["m5_nit_nativa"], "%.0f")),
+        ("M5 ridim", "%9s", lambda k, m: fmt(m.get("m5_nit_ridim"), "%.0f")),
+        ("M5 ritag", "%9s", lambda k, m: fmt(m.get("m5_nit_ritaglio"), "%.0f")),
         ("M5 SSIM", "%8s", lambda k, m: fmt(m["m5_ssim_med"], "%.3f")),
         ("M5 SSIMdt", "%10s", lambda k, m: fmt(m.get("m5_ssim_dt_med"), "%.3f")),
         ("M6 cv", "%7s", lambda k, m: fmt(m["m6_cv_area_med"], "%.3f")),
@@ -253,16 +266,14 @@ def render(results, usd_per_hour):
               " modelli. Rigenerare sulla stessa GPU prima di trarre conclusioni."
               % ", ".join(miste))
 
-    nativi = [k for k, m in results.items()
-              if m.get("m5_fonte") == "manifest, risoluzione nativa"]
+    nativi = [k for k, m in results.items() if m.get("m5_fonte") == "manifest"]
     if nativi:
         print("")
-        print("!!! %s: M5 viene dal manifest, cioe' dalla risoluzione NATIVA di ogni"
-              " modello. La varianza del Laplaciano cambia con la risoluzione a cui"
-              " e' calcolata - misurato 2,6 volte sulla stessa clip, e non in modo"
-              " monotono - quindi quelle nitidezze non si confrontano fra righe."
-              " Rigirare quality_gate.py --clips-dir per averle normalizzate."
-              % ", ".join(nativi))
+        print("!!! %s: di M5 c'e' solo la colonna nativa, presa dal manifest. Le"
+              " risoluzioni native non sono le stesse per tutti i modelli, quindi"
+              " quelle nitidezze si confrontano fra righe solo per quanto le"
+              " risoluzioni si somiglino. Rigirare quality_gate.py --clips-dir per"
+              " avere anche ridimensionata e ritaglio." % ", ".join(nativi))
 
     print("\nRiferimento M1: %.1f%% (bicicletta CARLA in modalita' testo, B.1-B.4)."
           % RIFERIMENTO_SAM_CARLA)
