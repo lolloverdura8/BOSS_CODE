@@ -126,6 +126,38 @@ def test_supporto_oltre_la_soglia_non_trovato():
     assert sel.supporto is None
 
 
+def test_tronco_scavalcato_non_e_supporto():
+    # ramo_sporgente_00 di wan22_5b: il ramo passa davanti al tronco dietro, da un
+    # bordo all'altro, e finisce contro il tronco davanti. Il tronco dietro ha piu'
+    # pixel di contatto (sopra e sotto il ramo) ma non lo regge.
+    ramo = cand(rect(200, 220, 200, 1000), 0.8)
+    dietro = cand(rect(0, 500, 900, 960) & ~ramo["mask"], 0.95)
+    davanti = cand(rect(100, 704, 1000, 1100), 0.9)
+    sel = S.seleziona([ramo], [], [dietro, davanti], (H, W))
+    assert (sel.supporto["mask"] == davanti["mask"]).all()
+    assert sel.diag["n_supporti_scavalcati"] == 1
+    assert sel.diag["criterio_supporto"] == "contatto_estremo"
+
+
+def test_barra_che_finisce_dentro_il_palo_resta_supporto():
+    # sospeso di ltx25, frame 33: il palo sporge sopra e sotto la barra, ma la barra
+    # finisce dentro la sua larghezza (un terzo), quindi e' il supporto
+    barra = cand(rect(200, 220, 200, 1000), 0.9)
+    palo = cand(rect(100, 704, 980, 1040) & ~barra["mask"], 0.9)
+    sel = S.seleziona([barra], [], [palo], (H, W))
+    assert sel.supporto is not None
+    assert sel.diag["n_supporti_scavalcati"] == 0
+
+
+def test_supporto_con_buco_attorno_all_oggetto_non_rompe():
+    # maschera del supporto interrotta per piu' di BANDA_LARGHEZZA_PX sopra e sotto
+    # l'oggetto (bordi erosi dall'occlusione): prima dava ZeroDivisionError
+    barra = cand(rect(50, 60, 100, 110), 0.8)
+    palo = cand(rect(0, 20, 100, 110) | rect(80, 100, 100, 110), 0.9)
+    sel = S.seleziona([barra], [], [palo], (H, W))
+    assert sel.diag["n_supporti_scavalcati"] == 0
+
+
 def test_supporto_doppione_dell_oggetto_non_lo_cancella():
     # sospeso di wan22_5b, frame 60-68: "pole" restituisce anche la barra stessa
     barra = cand(rect(99, 126, 297, 919), 0.92)

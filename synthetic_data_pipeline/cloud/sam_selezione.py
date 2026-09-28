@@ -56,6 +56,22 @@ ALLUNGAMENTO_MIN = 2.0
 # cancellava l'oggetto intero.
 IOU_DOPPIONE = 0.5
 
+# Un supporto che l'oggetto scavalca da un bordo all'altro gli sta davanti o dietro,
+# non lo regge. La quota e' il numero di colonne in cui il supporto sporge sopra E
+# sotto l'oggetto, diviso per la larghezza del supporto appena fuori dall'oggetto
+# (fascia di BANDA_LARGHEZZA_PX righe). Supporti verticali, come tronchi e pali.
+# Misurata il 28/09 sui candidati entro 40 px: il tronco dietro di
+# ramo_sporgente_00 (wan22_5b), che il ramo attraversa, sta fra 0,91 e 0,94 in tutti i
+# 19 frame; i supporti giudicati giusti a occhio fra 0 e 0,29 (palo del sospeso di
+# ltx25 al frame 33, dove la barra finisce dentro il palo). Nessuna ragione per
+# preferire un punto del vuoto fra i due: 0,6.
+# Limite voluto: se l'oggetto finisce dentro la larghezza del supporto la quota e'
+# bassa e il supporto resta idoneo, anche quando in realta' e' un tronco dietro. In
+# 2D quel caso non si distingue da un ramo che esce dal tronco o da una barra che
+# finisce contro il palo (ltx25, frame 33), che vanno tenuti.
+QUOTA_SCAVALCATO = 0.6
+BANDA_LARGHEZZA_PX = 10
+
 
 @dataclass(frozen=True)
 class Selezione:
@@ -158,16 +174,44 @@ def _zona_terminale(obj: np.ndarray):
     return terminale, ""
 
 
+def _quota_scavalcata(obj: np.ndarray, sup: np.ndarray) -> float:
+    """Colonne in cui sup sporge sopra e sotto obj, sulla larghezza di sup appena
+    fuori da obj. 0 se obj non lo attraversa in nessuna colonna."""
+    cols = np.flatnonzero(obj.any(axis=0) & sup.any(axis=0))
+    scavalcate = []
+    for x in cols:
+        yo, ys = np.flatnonzero(obj[:, x]), np.flatnonzero(sup[:, x])
+        if ys[0] < yo[0] and ys[-1] > yo[-1]:
+            scavalcate.append(x)
+    if not scavalcate:
+        return 0.0
+    rows = np.flatnonzero(obj[:, scavalcate].any(axis=1))
+    y0, y1 = rows[0], rows[-1] + 1
+    larghezza = max(int(sup[max(0, y0 - BANDA_LARGHEZZA_PX):y0].any(axis=0).sum()),
+                    int(sup[y1:y1 + BANDA_LARGHEZZA_PX].any(axis=0).sum()))
+    if larghezza == 0:
+        # sup sporge sopra e sotto ma con un buco oltre la fascia su entrambi i lati
+        # (bordi erosi dall'occlusione): la larghezza non si misura, e il candidato
+        # resta idoneo come prima della regola
+        return 0.0
+    return len(scavalcate) / larghezza
+
+
 def _scegli_supporto(obj: np.ndarray, cand_sup: list):
-    """(candidato, criterio, distanza, n a contatto, ripiego) sulla maschera finale."""
+    """(candidato, criterio, distanza, n a contatto, ripiego, n scavalcati) sulla
+    maschera finale."""
     if not cand_sup:
-        return None, "nessuno", None, 0, ""
+        return None, "nessuno", None, 0, "", 0
     dist = distance_transform_edt(~obj)
     terminale, ripiego = _zona_terminale(obj)
     idonei = []
+    n_scavalcati = 0
     for c in cand_sup:
         d = float(dist[c["mask"]].min())
         if d > SUPPORTO_DIST_MAX_PX:
+            continue
+        if _quota_scavalcata(obj, c["mask"]) >= QUOTA_SCAVALCATO:
+            n_scavalcati += 1
             continue
         vicini = np.argwhere(c["mask"] & (dist <= d + ADIACENZA_PX))
         n_term = int(terminale(vicini).sum())
@@ -176,11 +220,11 @@ def _scegli_supporto(obj: np.ndarray, cand_sup: list):
     contatto = [x for x in idonei if x[1] <= ADIACENZA_PX]
     if contatto:
         c, d, _ = max(contatto, key=lambda x: x[2])
-        return c, "contatto_estremo", d, len(contatto), ripiego
+        return c, "contatto_estremo", d, len(contatto), ripiego, n_scavalcati
     if idonei:
         c, d, _ = min(idonei, key=lambda x: x[1])
-        return c, "vicino", d, 0, ripiego
-    return None, "nessuno", None, 0, ripiego
+        return c, "vicino", d, 0, ripiego, n_scavalcati
+    return None, "nessuno", None, 0, ripiego, n_scavalcati
 
 
 def _non_vuoti(cands: list) -> list:
@@ -209,6 +253,7 @@ def seleziona(cand_obj: list, cand_extra: list, cand_sup: list,
             "seme_prompt": "", "seme_y1": "", "seme_y2": "", "area_seme": 0,
             "area_finale": 0, "n_uniti": 0, "n_scartati_unione": 0,
             "px_sottratti_supporto": 0, "n_supporti_contatto": 0,
+            "n_supporti_scavalcati": 0,
             "criterio_supporto": "nessuno", "dist_supporto_px": "",
             "terminale_degenere": ""}
 
@@ -221,7 +266,7 @@ def seleziona(cand_obj: list, cand_extra: list, cand_sup: list,
     # sono stati tolti perche' supporto
     originali |= c_seme["mask"]
 
-    sup, criterio, d, n_contatto, ripiego = _scegli_supporto(unione, cand_sup)
+    sup, criterio, d, n_contatto, ripiego, n_scavalcati = _scegli_supporto(unione, cand_sup)
     finale = unione & ~sup["mask"] if sup else unione.copy()
     y1, y2 = _bordi_y(seme)
     diag.update({"esito_selezione": "ok" if finale.any() else "cancellato_dal_supporto",
@@ -229,7 +274,8 @@ def seleziona(cand_obj: list, cand_extra: list, cand_sup: list,
                  "area_seme": int(seme.sum()), "area_finale": int(finale.sum()),
                  "n_uniti": n_uniti, "n_scartati_unione": n_scartati,
                  "px_sottratti_supporto": int(originali.sum() - finale.sum()),
-                 "n_supporti_contatto": n_contatto, "criterio_supporto": criterio,
+                 "n_supporti_contatto": n_contatto, "n_supporti_scavalcati": n_scavalcati,
+                 "criterio_supporto": criterio,
                  "dist_supporto_px": round(d, 1) if d is not None else "",
                  "terminale_degenere": ripiego})
     if not finale.any():

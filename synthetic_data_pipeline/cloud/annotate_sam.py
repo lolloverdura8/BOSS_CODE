@@ -83,7 +83,7 @@ DIAG_KEYS = ("prompt_extra", "esito_selezione", "n_cand_oggetto", "n_cand_extra"
              "area_seme", "area_finale", "n_uniti", "n_scartati_unione",
              "px_sottratti_supporto", "n_supporti_contatto", "criterio_supporto",
              "dist_supporto_px", "terminale_degenere", "n_scartati_non_finiti",
-             "n_maschere_vuote")
+             "n_maschere_vuote", "n_supporti_scavalcati")
 
 # Gruppi di candidati salvati per frame in candidati/<clip>/NNN.npz.
 GRUPPI_CANDIDATI = ("oggetto", "extra", "supporto")
