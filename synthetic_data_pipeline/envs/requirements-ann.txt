@@ -44,6 +44,10 @@ timm==1.0.28
 # _core, che e' il motivo per cui annotate_da3.py non parte in locale.
 pycolmap==4.1.1
 pillow_heif==1.5.0
+# depth_anything_3 lo importa senza dichiararlo nel suo pyproject: senza, il venv
+# si installa ma il modello non si importa (verificato il 28/09/2026 in WSL2). La
+# versione e' quella del venv Windows in cui DA3 girava il 14/09.
+addict==2.4.0
 
 psutil==7.2.2
 tqdm==4.70.0
