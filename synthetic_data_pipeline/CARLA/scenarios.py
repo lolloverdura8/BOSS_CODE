@@ -176,4 +176,93 @@ SCENARIOS = {
              "boss_class": "ostacolo_sospeso_generico", "physics": False},
         ],
     },
+
+    # --- ramo Sim2Real ---------------------------------------------------------
+    #
+    # Sorgente per i generatori video-to-video (Cosmos-Transfer2.5, Wan2.2-Fun
+    # Control): CARLA da' la scena esatta, il modello ne ridipinge l'aspetto.
+    # Rispetto a overhead_obstacle cambia tutto cio' che il generatore impone:
+    #
+    #   - 1280x720 a 48 Hz. 16:9 nativo, perche' ritagliare un 4:3 taglierebbe la
+    #     fascia alta, dove stanno i sospesi; 48 Hz perche' e' il minimo comune
+    #     multiplo dei 16 fps di Cosmos e dei 24 di Wan, che lo ottengono
+    #     prendendo un frame su tre e uno su due, senza interpolare.
+    #   - Un solo ostacolo per scena, cosi' la verifica di coerenza non deve
+    #     districare istanze.
+    #   - spawn_lead_m 11 invece di 5. A 16:9 il semi-FOV verticale e' di ~26
+    #     gradi: un ostacolo a 2,0 m, ~0,34 m sopra la camera, esce di campo a
+    #     ~0,7 m. Piazzato 5 m avanti resterebbe in vista ~3 s, meno dei 5,8 s
+    #     (93 frame a 16 fps) che Cosmos ridipinge; a 11 m sono ~7,3 s a 1,4 m/s.
+    #     Il prezzo e' un errore di estrapolazione piu' grande se il marciapiede
+    #     curva: lo intercetta A8, che chiede la finestra contigua min_window_s.
+    #   - Stesso seme (2) e quindi stesso percorso di overhead_obstacle per
+    #     tutte e tre: fra le tre clip cambia solo l'ostacolo.
+    #   - Pochi pedoni NPC: uno che passa davanti all'ostacolo spezzerebbe la
+    #     finestra contigua.
+    #
+    # La quota sta nella fascia testa/busto (criterio dell'utente del 28/09): e'
+    # garantita per costruzione, ed e' il difetto che il text-to-video non riusciva
+    # a evitare (A14B mette i sospesi ad altezza piedi).
+    "s2r_ramo": {
+        "map": _TOWN,
+        "weather": "ClearNoon",
+        "n_frames": 480,
+        "seed": 2,
+        "walker_bp_index": 1,
+        "walker_spawn_index": _SPAWN_A,
+        "walker_target_index": _TARGET_A,
+        "traffic_vehicles": 10,
+        "traffic_walkers": 5,
+        "width": 1280,
+        "height": 720,
+        "fps": 48,
+        "spawn_lead_m": 11.0,
+        "min_window_s": 5.9,
+        "actors": [
+            {"blueprint": "static.prop.streetbarrier", "forward": 13.0, "lateral": 0.0, "z": 2.00, "yaw": 90.0,
+             "boss_class": "ramo_sporgente", "physics": False},
+        ],
+    },
+
+    "s2r_insegna": {
+        "map": _TOWN,
+        "weather": "ClearNoon",
+        "n_frames": 480,
+        "seed": 2,
+        "walker_bp_index": 1,
+        "walker_spawn_index": _SPAWN_A,
+        "walker_target_index": _TARGET_A,
+        "traffic_vehicles": 10,
+        "traffic_walkers": 5,
+        "width": 1280,
+        "height": 720,
+        "fps": 48,
+        "spawn_lead_m": 11.0,
+        "min_window_s": 5.9,
+        "actors": [
+            {"blueprint": "static.prop.warningconstruction", "forward": 13.0, "lateral": -0.6, "z": 1.80, "yaw": 0.0,
+             "boss_class": "insegna_cartello_basso", "physics": False},
+        ],
+    },
+
+    "s2r_sospeso_generico": {
+        "map": _TOWN,
+        "weather": "ClearNoon",
+        "n_frames": 480,
+        "seed": 2,
+        "walker_bp_index": 1,
+        "walker_spawn_index": _SPAWN_A,
+        "walker_target_index": _TARGET_A,
+        "traffic_vehicles": 10,
+        "traffic_walkers": 5,
+        "width": 1280,
+        "height": 720,
+        "fps": 48,
+        "spawn_lead_m": 11.0,
+        "min_window_s": 5.9,
+        "actors": [
+            {"blueprint": "static.prop.box02", "forward": 13.0, "lateral": 0.3, "z": 1.60, "yaw": 30.0,
+             "boss_class": "ostacolo_sospeso_generico", "physics": False},
+        ],
+    },
 }

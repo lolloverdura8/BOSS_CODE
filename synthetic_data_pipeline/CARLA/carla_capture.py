@@ -115,6 +115,11 @@ DEPTH_MAX_U16 = 65535
 
 PROGRESS_EVERY = 25
 
+# Durata della finestra di posizioni recenti con cui si stima la direzione di
+# marcia (vedi recent_locs in capture()): 8 tick a 16 Hz. Espressa in secondi
+# perche' gli scenari Sim2Real girano a 48 Hz, dove 8 tick sarebbero 0,17 s.
+DIRECTION_WINDOW_S = 0.5
+
 # Controlli di accettazione: parametri.
 A3_SAMPLE_FRAMES = 20       # frame campionati per le verifiche statistiche
 A4_SKY_TOLERANCE = 0.99     # quota minima di pixel di cielo che deve stare al massimo
@@ -151,6 +156,37 @@ def compute_intrinsics(width, height, fov_deg):
     """Matrice K della camera pinhole di CARLA (pixel quadrati, principale al centro)."""
     f = width / (2.0 * math.tan(math.radians(fov_deg) / 2.0))
     return {"fx": f, "fy": f, "cx": width / 2.0, "cy": height / 2.0}
+
+
+def vertical_fov_deg(width, height, fov_deg):
+    """FOV verticale: CARLA fissa l'orizzontale, il verticale segue l'aspect."""
+    half_h = math.tan(math.radians(fov_deg) / 2.0)
+    return math.degrees(2.0 * math.atan(half_h * height / float(width)))
+
+
+def capture_geometry(scenario):
+    """Risoluzione e passo di una sessione, letti dallo scenario.
+
+    Gli scenari del reference set non dichiarano nulla e restano a 1008x756 e
+    16 Hz: e' cio' che tiene riproducibile eval_set.json. Gli scenari Sim2Real
+    dichiarano width, height e fps nello scenario stesso, e non da riga di
+    comando: cosi' finiscono testualmente in session.json, e una sessione non si
+    puo' registrare alla geometria sbagliata dimenticando un flag.
+
+    I tick di warmup e la finestra di direzione sono durate, non conteggi: a
+    48 Hz gli stessi 30 tick durerebbero un terzo, e LOD e meteo non farebbero in
+    tempo ad assestarsi. Al passo di default i conteggi restano quelli di prima.
+    """
+    fps = scenario.get("fps")
+    fixed_delta = 1.0 / fps if fps else FIXED_DELTA_SECONDS
+    return {
+        "width": scenario.get("width", WIDTH),
+        "height": scenario.get("height", HEIGHT),
+        "fixed_delta": fixed_delta,
+        "warmup_ticks": round(WARMUP_TICKS * FIXED_DELTA_SECONDS / fixed_delta),
+        "direction_window": round(DIRECTION_WINDOW_S / fixed_delta) + 1,
+        "spawn_lead_m": scenario.get("spawn_lead_m", SPAWN_LEAD_M),
+    }
 
 
 def transform_to_dict(tf):
@@ -347,7 +383,7 @@ def walker_origin_above_feet(walker):
     return bb.extent.z - bb.location.z
 
 
-def build_sensors(world, library, parent, origin_above_feet):
+def build_sensors(world, library, parent, origin_above_feet, width, height):
     """I quattro sensori, con attributi rigorosamente identici (R5).
 
     Risoluzione, FOV e trasformazione relativa vengono da un solo dizionario e da
@@ -359,7 +395,7 @@ def build_sensors(world, library, parent, origin_above_feet):
     """
     camera_z_relative = CAMERA_Z - origin_above_feet
 
-    attrs = {"image_size_x": str(WIDTH), "image_size_y": str(HEIGHT),
+    attrs = {"image_size_x": str(width), "image_size_y": str(height),
              "fov": str(FOV), "sensor_tick": "0.0"}
     tf = carla.Transform(carla.Location(x=CAMERA_X, z=camera_z_relative))
     ids = {
@@ -409,6 +445,9 @@ def pull_synced_frame(queues, expected_frame):
 
 def capture(scenario_name, out_dir):
     scenario = SCENARIOS[scenario_name]
+    geom = capture_geometry(scenario)
+    warmup_ticks = geom["warmup_ticks"]
+    spawn_lead_m = geom["spawn_lead_m"]
 
     client = carla.Client(HOST, PORT)
     client.set_timeout(CLIENT_TIMEOUT_S)
@@ -434,7 +473,7 @@ def capture(scenario_name, out_dir):
 
         settings = world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
+        settings.fixed_delta_seconds = geom["fixed_delta"]
         world.apply_settings(settings)
         traffic_manager.set_synchronous_mode(True)
 
@@ -490,7 +529,8 @@ def capture(scenario_name, out_dir):
                                           scenario["traffic_walkers"],
                                           set(s["blueprint"] for s in scenario["actors"])))
 
-        sensors, queues, camera_tf = build_sensors(world, library, walker, origin_above_feet)
+        sensors, queues, camera_tf = build_sensors(world, library, walker, origin_above_feet,
+                                                   geom["width"], geom["height"])
 
         for sub in ("rgb", "depth", "semantic", "instance"):
             os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
@@ -517,9 +557,10 @@ def capture(scenario_name, out_dir):
         last_loc = walker.get_transform().location
         # Finestra di posizioni recenti per stimare la direzione dalla traiettoria
         # effettiva, senza assumere che rotation.yaw del pedone segua il moto
-        # (comportamento interno non documentato): 8 tick (0,5 s) bastano a
-        # mediare il rumore tick-per-tick restando comunque locali nel tempo.
-        recent_locs = deque(maxlen=9)
+        # (comportamento interno non documentato): 0,5 s (DIRECTION_WINDOW_S, 8
+        # tick a 16 Hz, 24 a 48 Hz) bastano a mediare il rumore tick-per-tick
+        # restando comunque locali nel tempo.
+        recent_locs = deque(maxlen=geom["direction_window"])
         recent_locs.append(last_loc)
         # Stima di riserva finche' la finestra non e' stabile, o se un ostacolo
         # resta ancora da piazzare a fine sessione (fallback dopo il ciclo, dove
@@ -539,7 +580,7 @@ def capture(scenario_name, out_dir):
         written = 0
 
         with open(poses_path, "w") as poses:
-            for tick_index in range(WARMUP_TICKS + n_frames):
+            for tick_index in range(warmup_ticks + n_frames):
                 expected = world.tick()
 
                 cur_loc = walker.get_transform().location
@@ -557,7 +598,7 @@ def capture(scenario_name, out_dir):
                 # cono di ripresa per l'intera sessione. Il WARMUP_TICKS esiste gia'
                 # per LOD/meteo (par. 14): qui in piu' garantisce che il pedone
                 # cammini per davvero prima che qualunque prop venga piazzato.
-                if pending and tick_index >= WARMUP_TICKS and len(recent_locs) == recent_locs.maxlen:
+                if pending and tick_index >= warmup_ticks and len(recent_locs) == recent_locs.maxlen:
                     ref_loc = recent_locs[0]
                     dx, dy = cur_loc.x - ref_loc.x, cur_loc.y - ref_loc.y
                     norm = math.hypot(dx, dy)
@@ -570,12 +611,12 @@ def capture(scenario_name, out_dir):
 
                     still_pending = []
                     for spec in pending:
-                        if path_distance < spec["forward"] - SPAWN_LEAD_M:
+                        if path_distance < spec["forward"] - spawn_lead_m:
                             still_pending.append(spec)
                             continue
                         loc = carla.Location(
-                            x=cur_loc.x + cur_fwd[0] * SPAWN_LEAD_M + cur_right[0] * spec["lateral"],
-                            y=cur_loc.y + cur_fwd[1] * SPAWN_LEAD_M + cur_right[1] * spec["lateral"],
+                            x=cur_loc.x + cur_fwd[0] * spawn_lead_m + cur_right[0] * spec["lateral"],
+                            y=cur_loc.y + cur_fwd[1] * spawn_lead_m + cur_right[1] * spec["lateral"],
                             z=(cur_loc.z - origin_above_feet) + spec["z"],
                         )
                         result = spawn_one_actor(world, library, spec, loc, cur_yaw)
@@ -586,10 +627,10 @@ def capture(scenario_name, out_dir):
                     pending = still_pending
 
                 images = pull_synced_frame(queues, expected)
-                if tick_index < WARMUP_TICKS:
+                if tick_index < warmup_ticks:
                     continue
 
-                idx = tick_index - WARMUP_TICKS
+                idx = tick_index - warmup_ticks
                 stem = "%06d.png" % idx
 
                 ok, buf = cv2.imencode(".png", to_bgra(images["rgb"])[:, :, :3])
@@ -642,8 +683,8 @@ def capture(scenario_name, out_dir):
                   " ne servivano %.1f): piazzato alla posizione finale del pedone."
                   % (spec["boss_class"], path_distance, spec["forward"]), file=sys.stderr)
             loc = carla.Location(
-                x=cur_loc.x + cur_fwd[0] * SPAWN_LEAD_M + cur_right[0] * spec["lateral"],
-                y=cur_loc.y + cur_fwd[1] * SPAWN_LEAD_M + cur_right[1] * spec["lateral"],
+                x=cur_loc.x + cur_fwd[0] * spawn_lead_m + cur_right[0] * spec["lateral"],
+                y=cur_loc.y + cur_fwd[1] * spawn_lead_m + cur_right[1] * spec["lateral"],
                 z=(cur_loc.z - origin_above_feet) + spec["z"],
             )
             result = spawn_one_actor(world, library, spec, loc, cur_yaw)
@@ -666,12 +707,17 @@ def capture(scenario_name, out_dir):
             "map": scenario["map"],
             "weather": scenario["weather"],
             "seed": scenario["seed"],
-            "fixed_delta_seconds": FIXED_DELTA_SECONDS,
-            "warmup_ticks": WARMUP_TICKS,
-            "width": WIDTH,
-            "height": HEIGHT,
+            "fixed_delta_seconds": geom["fixed_delta"],
+            "warmup_ticks": warmup_ticks,
+            "width": geom["width"],
+            "height": geom["height"],
             "fov": FOV,
-            "intrinsics": compute_intrinsics(WIDTH, HEIGHT, FOV),
+            # CARLA fissa il FOV orizzontale: a 16:9 il verticale scende a ~52
+            # gradi contro i ~66 del 4:3 della stereocamera, e un ostacolo a quota
+            # testa esce di campo piu' presto. Dichiararlo evita di scoprirlo
+            # confrontando sessioni con aspect diverso.
+            "vertical_fov": vertical_fov_deg(geom["width"], geom["height"], FOV),
+            "intrinsics": compute_intrinsics(geom["width"], geom["height"], FOV),
             "depth_scale": DEPTH_SCALE,
             "depth_unit": "mm",
             "depth_max_u16": DEPTH_MAX_U16,
@@ -684,7 +730,7 @@ def capture(scenario_name, out_dir):
             # ciascun ostacolo (vedi SPAWN_LEAD_M), non la retta spawn->target, che
             # serve solo da stima iniziale di riserva.
             "path_distance_walked_m": path_distance,
-            "spawn_lead_m": SPAWN_LEAD_M,
+            "spawn_lead_m": spawn_lead_m,
             "spawned_actors": [dict((k, v) for k, v in a.items() if k != "_actor")
                                for a in scenario_actors],
             "n_frames_written": written,
@@ -843,6 +889,8 @@ def run_acceptance_checks(out_dir):
         record("A7", None, "nessun attore tracciato in questo scenario")
     else:
         seen = dict((a["instance_id"], 0) for a in tracked)
+        run = dict((a["instance_id"], 0) for a in tracked)
+        best_run = dict((a["instance_id"], 0) for a in tracked)
         for name in counts["instance"]:
             inst = cv2.imread(os.path.join(out_dir, "instance", name), cv2.IMREAD_UNCHANGED)
             # (B<<8)|G, non (G<<8)|B come da doc ufficiale: vedi la nota in
@@ -852,11 +900,34 @@ def run_acceptance_checks(out_dir):
             for iid in seen:
                 if iid in present:
                     seen[iid] += 1
+                    run[iid] += 1
+                    best_run[iid] = max(best_run[iid], run[iid])
+                else:
+                    run[iid] = 0
         weak = [(a["boss_class"], a["instance_id"], seen[a["instance_id"]])
                 for a in tracked if seen[a["instance_id"]] < A7_MIN_FRAMES]
         record("A7", not weak,
                "tutti i %d attori tracciati visibili in >= %d frame" % (len(tracked), A7_MIN_FRAMES)
                if not weak else "fuori campo o quasi: %s" % weak)
+
+        # A8, solo per gli scenari Sim2Real: il generatore ridipinge una finestra
+        # CONTIGUA (93 frame a 16 fps per Cosmos), quindi non basta che l'ostacolo
+        # compaia in abbastanza frame in totale come chiede A7. Un buco a meta'
+        # spezzerebbe la clip, e un ostacolo che compare a finestra iniziata
+        # sarebbe un pop-in che nessun video reale contiene.
+        # Limite voluto: "visibile" vuol dire almeno un pixel dell'istanza, come in
+        # A7. Che l'ostacolo sia grande abbastanza da servire lo decide la scelta
+        # della finestra in prepare_controls.py, non questo controllo.
+        min_window_s = session["scenario_config"].get("min_window_s")
+        if min_window_s:
+            need = math.ceil(min_window_s / session["fixed_delta_seconds"])
+            short = [(a["boss_class"], a["instance_id"], best_run[a["instance_id"]])
+                     for a in tracked if best_run[a["instance_id"]] < need]
+            record("A8", not short,
+                   "finestra contigua >= %d frame (%.1f s) per tutti i %d attori"
+                   % (need, min_window_s, len(tracked))
+                   if not short else "finestra contigua troppo corta (servono %d): %s"
+                   % (need, short))
 
     return results
 
