@@ -51,6 +51,9 @@ from scene_actors import (ApproachingRider, place_obstacle, resolve_blueprint, s
 
 HOST, PORT = "localhost", 2000
 CLIENT_TIMEOUT_S = 20.0
+# load_world ricarica la mappa anche se e' gia' quella: da un volume di rete
+# (RunPod) supera i 20 s del client e la cattura muore prima di cominciare.
+LOAD_WORLD_TIMEOUT_S = 180.0
 
 # Risoluzione allineata agli ANNOTATORI, non ai generatori. La cattura e' la
 # sorgente di ground truth, e la ground truth viene confrontata con l'output di
@@ -607,7 +610,9 @@ def capture(scenario_name, out_dir):
     client.set_timeout(CLIENT_TIMEOUT_S)
     carla_version = check_versions(client)
 
+    client.set_timeout(LOAD_WORLD_TIMEOUT_S)
     world = client.load_world(scenario["map"])
+    client.set_timeout(CLIENT_TIMEOUT_S)
     library = world.get_blueprint_library()
     validate_scenario(scenario, library)
     validate_meshes(world, library, scenario)
