@@ -67,7 +67,16 @@ _TOWN = "Town10HD_Opt"
 # stradali - quelli metterebbero il pedone in mezzo alla carreggiata.
 _SPAWN_A, _TARGET_A = 0, 7
 
-# Comune alle scene Sim2Real: stessa mappa, meteo, seme e quindi percorso, stessa
+# Il percorso del viale alberato, come registrato da overhead_obstacle il 07/09
+# (session.json, walker_spawn e walker_target). Il pool della nav mesh cambia col
+# server: su Linux lo stesso seme parte altrove, quindi le scene Sim2Real, che
+# sono costruite su quegli alberi, lo fissano in coordinate di mappa.
+_VIALE = {
+    "spawn": [-34.1138916015625, 78.43087005615234, 0.15861999988555908],
+    "target": [89.18896484375, -1.477980613708496, 0.15861999988555908],
+}
+
+# Comune alle scene Sim2Real: stessa mappa, meteo, seme e percorso, stessa
 # geometria di cattura. Ogni scena aggiunge i suoi attori (vedi sotto).
 _S2R = {
     "map": _TOWN,
@@ -77,6 +86,7 @@ _S2R = {
     "walker_bp_index": 1,
     "walker_spawn_index": _SPAWN_A,
     "walker_target_index": _TARGET_A,
+    "walker_route": _VIALE,
     "traffic_vehicles": 10,
     "traffic_walkers": 5,
     "width": 1280,

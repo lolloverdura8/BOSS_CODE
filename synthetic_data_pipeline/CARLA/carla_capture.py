@@ -143,7 +143,7 @@ HEADING_MIN_MOTION_M = 0.05
 SCENARIO_KEYS = {"map", "weather", "wind_intensity", "n_frames", "seed", "walker_bp_index",
                  "walker_spawn_index", "walker_target_index", "traffic_vehicles",
                  "traffic_walkers", "width", "height", "fps", "spawn_lead_m", "min_window_s",
-                 "place_at_start", "actors", "movers"}
+                 "place_at_start", "actors", "movers", "walker_route"}
 ACTOR_KEYS = {"blueprint", "mesh", "scale", "forward", "lateral", "z", "yaw", "pitch", "roll",
               "boss_class", "physics", "anchor", "support"}
 ACTOR_REQUIRED = ("forward", "lateral", "z", "yaw", "boss_class", "physics")
@@ -267,6 +267,13 @@ def validate_scenario(scenario, library):
     if declared and len(declared) != len(S2R_KEYS):
         sys.exit("scenario Sim2Real incompleto: dichiara %s ma non %s"
                  % (declared, [k for k in S2R_KEYS if k not in scenario]))
+    route = scenario.get("walker_route")
+    if route is not None:
+        _check_keys("walker_route", route, {"spawn", "target"}, ("spawn", "target"))
+        for key in ("spawn", "target"):
+            point = route[key]
+            if len(point) != 3 or not all(isinstance(v, (int, float)) for v in point):
+                sys.exit("walker_route.%s deve essere [x, y, z] in metri: %s" % (key, point))
     for spec in scenario["actors"]:
         _check_keys("ostacolo", spec, ACTOR_KEYS, ACTOR_REQUIRED)
         _check_source("ostacolo", spec, library)
@@ -652,6 +659,15 @@ def capture(scenario_name, out_dir):
         # walker_target_index resta nello scenario solo come documentazione
         # dell'intento originale.
         target_loc = max(nav_pool, key=spawn_loc.distance)
+        route = scenario.get("walker_route")
+        if route is not None:
+            # Il pool dipende dal server, non solo dal seme: lo stesso seed 2 che su
+            # Windows parte dal viale alberato, sul server Linux di RunPod parte da
+            # (117,8; 42,6), a 11,5 m dall'albero piu' vicino (05/10). Le scene
+            # costruite su quel viale fissano quindi spawn e target in coordinate.
+            # Il pool si estrae lo stesso, per non spostare i pedoni del traffico.
+            spawn_loc = carla.Location(*route["spawn"])
+            target_loc = carla.Location(*route["target"])
         fwd, right, base_yaw = path_frame(spawn_loc, target_loc)
 
         world.set_weather(getattr(carla.WeatherParameters, scenario["weather"]))

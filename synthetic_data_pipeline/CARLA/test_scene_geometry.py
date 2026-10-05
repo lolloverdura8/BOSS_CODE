@@ -142,6 +142,22 @@ def test_geometria_s2r_incompleta_si_ferma():
     assert "min_window_s" in msg
 
 
+def test_le_scene_s2r_fissano_il_viale():
+    from scenarios import SCENARIOS
+    for name, sc in SCENARIOS.items():
+        if name.startswith("s2r_"):
+            assert sc["walker_route"]["spawn"][:2] == [-34.1138916015625, 78.43087005615234], name
+
+
+def test_percorso_con_punto_incompleto_si_ferma():
+    import carla_capture as C
+    from scenarios import SCENARIOS
+    sc = dict(SCENARIOS["s2r_insegna"])
+    sc["walker_route"] = {"spawn": [-34.1, 78.4], "target": [89.2, -1.5, 0.16]}
+    msg = expect_exit(lambda: C.validate_scenario(sc, FakeLibrary([])))
+    assert "walker_route.spawn" in msg
+
+
 def test_ostacolo_con_blueprint_e_mesh_si_ferma():
     import carla_capture as C
     from scenarios import SCENARIOS
