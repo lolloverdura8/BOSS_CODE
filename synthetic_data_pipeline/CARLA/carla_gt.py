@@ -122,6 +122,21 @@ def instance_mask(tag, ids, carla_tag, instance_id):
     return (ids == instance_id) & (tag == carla_tag)
 
 
+def record_mask(tag, ids, record):
+    """Maschera di un record di annotations.jsonl, anche se l'oggetto e' composto.
+
+    Un oggetto fatto di piu' attori (il monopattino del ramo Sim2Real) e' un record
+    solo con la lista "parts" delle coppie (tag, id): la sua maschera e' l'unione.
+    Chi rilegge la GT deve passare di qui e non da instance_mask(), che sui record
+    composti restituirebbe il solo pezzo piu' grande.
+    """
+    parts = record.get("parts") or [[record["carla_tag"], record["instance_id"]]]
+    mask = np.zeros(tag.shape, dtype=bool)
+    for carla_tag, instance_id in parts:
+        mask |= instance_mask(tag, ids, carla_tag, instance_id)
+    return mask
+
+
 # --- verifica delle convenzioni ----------------------------------------------
 
 def _load_session(session_dir):
@@ -234,7 +249,7 @@ def _check_composite_key(session_dir):
     matched = mismatched = 0
     id_only_wrong = 0
     for inst in best["instances"]:
-        m = instance_mask(tag, ids, inst["carla_tag"], inst["instance_id"])
+        m = record_mask(tag, ids, inst)
         if not m.any():
             mismatched += 1
             continue
@@ -245,7 +260,7 @@ def _check_composite_key(session_dir):
             matched += 1
         else:
             mismatched += 1
-        if int((ids == inst["instance_id"]).sum()) != inst["area_px"]:
+        if "parts" not in inst and int((ids == inst["instance_id"]).sum()) != inst["area_px"]:
             id_only_wrong += 1
 
     ok = mismatched == 0 and matched > 0

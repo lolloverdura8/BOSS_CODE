@@ -45,12 +45,46 @@
 # trovati. Un id sbagliato diventa cosi' un errore immediato e leggibile invece
 # di una scena silenziosamente diversa da quella progettata.
 
+# --- chiavi delle dichiarazioni (dal 05/10) ----------------------------------
+#
+# Un ostacolo viene da "blueprint" (un id del catalogo) oppure da "mesh" (un
+# percorso sotto /Game/Carla/Static/, spawnato con static.prop.mesh e "scale"
+# uniforme): i percorsi validi stanno in CarlaUE4/AssetRegistry.bin, e
+# scene_actors.validate_meshes() li prova tutti prima di registrare. Facoltativi:
+#   pitch, roll       gradi, oltre allo yaw
+#   anchor: "tree"    l'ostacolo parte dal tronco dell'albero vero piu' vicino al
+#                     punto (forward, lateral); lo yaw lo ruota verso il pedone
+#   support           un secondo attore (un palo) con offset forward/lateral
+#                     relativi all'ostacolo e quota z dal suolo; non porta la
+#                     classe dell'ostacolo
+# "movers" dichiara mezzi in movimento (scene_actors.ApproachingRider); richiede
+# place_at_start. carla_capture.validate_scenario rifiuta chiavi sconosciute.
+
 _TOWN = "Town10HD_Opt"
 
 # Punti di navigazione: indici in un pool di locazioni estratte in modo
 # deterministico dalla nav mesh (vedi carla_capture.py). Non sono spawn point
 # stradali - quelli metterebbero il pedone in mezzo alla carreggiata.
 _SPAWN_A, _TARGET_A = 0, 7
+
+# Comune alle scene Sim2Real: stessa mappa, meteo, seme e quindi percorso, stessa
+# geometria di cattura. Ogni scena aggiunge i suoi attori (vedi sotto).
+_S2R = {
+    "map": _TOWN,
+    "weather": "ClearNoon",
+    "wind_intensity": 0.0,
+    "seed": 2,
+    "walker_bp_index": 1,
+    "walker_spawn_index": _SPAWN_A,
+    "walker_target_index": _TARGET_A,
+    "traffic_vehicles": 10,
+    "traffic_walkers": 5,
+    "width": 1280,
+    "height": 720,
+    "fps": 48,
+    "min_window_s": 5.9,
+    "place_at_start": True,
+}
 
 SCENARIOS = {
 
@@ -181,88 +215,110 @@ SCENARIOS = {
     #
     # Sorgente per i generatori video-to-video (Cosmos-Transfer2.5, Wan2.2-Fun
     # Control): CARLA da' la scena esatta, il modello ne ridipinge l'aspetto.
-    # Rispetto a overhead_obstacle cambia tutto cio' che il generatore impone:
     #
-    #   - 1280x720 a 48 Hz. 16:9 nativo, perche' ritagliare un 4:3 taglierebbe la
-    #     fascia alta, dove stanno i sospesi; 48 Hz perche' e' il minimo comune
-    #     multiplo dei 16 fps di Cosmos e dei 24 di Wan, che lo ottengono
-    #     prendendo un frame su tre e uno su due, senza interpolare.
-    #   - Un solo ostacolo per scena, cosi' la verifica di coerenza non deve
-    #     districare istanze.
-    #   - spawn_lead_m 11 invece di 5. A 16:9 il semi-FOV verticale e' di ~26
-    #     gradi: un ostacolo a 2,0 m, ~0,34 m sopra la camera, esce di campo a
-    #     ~0,7 m. Piazzato 5 m avanti resterebbe in vista ~3 s, meno dei 5,8 s
-    #     (93 frame a 16 fps) che Cosmos ridipinge; a 11 m sono ~7,3 s a 1,4 m/s.
-    #     Il prezzo e' un errore di estrapolazione piu' grande se il marciapiede
-    #     curva: lo intercetta A8, che chiede la finestra contigua min_window_s.
-    #   - Stesso seme (2) e quindi stesso percorso di overhead_obstacle per
-    #     tutte e tre: fra le tre clip cambia solo l'ostacolo.
-    #   - Pochi pedoni NPC: uno che passa davanti all'ostacolo spezzerebbe la
-    #     finestra contigua.
+    # Dal 05/10 le scene rappresentano situazioni vere, non prop sospesi nel vuoto:
+    # un ramo esce dal tronco di un albero del viale, un cartello sta sul suo palo,
+    # una cassetta e' montata su un palo, il monopattino ha conducente, asta, pedana
+    # e ruote. Tutte progettate e guardate a vista sul percorso del seme 2, un viale
+    # dritto con alberi veri a ~2 m a sinistra della linea di marcia e facciate a
+    # ~4 m a destra (tronchi a x -25,8 / -16,3 / -3,4 / 8,1 ...).
     #
-    # La quota sta nella fascia testa/busto (criterio dell'utente del 28/09): e'
-    # garantita per costruzione, ed e' il difetto che il text-to-video non riusciva
-    # a evitare (A14B mette i sospesi ad altezza piedi).
-    "s2r_ramo": {
-        "map": _TOWN,
-        "weather": "ClearNoon",
-        "n_frames": 480,
-        "seed": 2,
-        "walker_bp_index": 1,
-        "walker_spawn_index": _SPAWN_A,
-        "walker_target_index": _TARGET_A,
-        "traffic_vehicles": 10,
-        "traffic_walkers": 5,
-        "width": 1280,
-        "height": 720,
-        "fps": 48,
-        "spawn_lead_m": 11.0,
-        "min_window_s": 5.9,
-        "actors": [
-            {"blueprint": "static.prop.streetbarrier", "forward": 13.0, "lateral": 0.0, "z": 2.00, "yaw": 90.0,
-             "boss_class": "ramo_sporgente", "physics": False},
-        ],
-    },
+    #   - 1280x720 a 48 Hz: 16:9 nativo, perche' ritagliare un 4:3 taglierebbe la
+    #     fascia alta, dove stanno i sospesi; 48 Hz e' il minimo comune multiplo dei
+    #     16 fps di Cosmos e dei 24 di Wan, che lo ottengono prendendo un frame su
+    #     tre e uno su due, senza interpolare.
+    #   - place_at_start: tutto si piazza all'ultimo tick di warmup, a "forward"
+    #     metri dal pedone. Gli ostacoli ci sono dal frame 0 (niente pop-in) e la
+    #     distanza dichiarata e' quella del frame 0. Il primo albero oltre i 10 m e'
+    #     a ~15 m, quindi il ramo resta in vista ~10 s camminando a 1,4 m/s.
+    #   - Vento a zero: le foglie non tremano fra un frame e l'altro e la sessione
+    #     si ripete identica (col vento due catture uguali differivano sul 2,5-6 %
+    #     della depth, revisione 05/10).
+    #   - Stesso seme (2) e quindi stesso percorso di overhead_obstacle per tutte:
+    #     fra le clip cambia l'ostacolo. Attenzione se qualcosa viene addestrato su
+    #     queste e misurato su eval_set, che contiene overhead_obstacle.
+    #   - Pochi pedoni NPC: uno che passa davanti all'ostacolo lo copre per qualche
+    #     frame (A8 tollera buchi fino a 0,25 s).
+    #
+    # Le quote stanno nella fascia testa/busto (criterio dell'utente del 28/09), per
+    # costruzione: e' il difetto che il text-to-video non riusciva a evitare (A14B
+    # mette i sospesi ad altezza piedi). La camera e' a 1,5 m dal suolo.
 
-    "s2r_insegna": {
-        "map": _TOWN,
-        "weather": "ClearNoon",
-        "n_frames": 480,
-        "seed": 2,
-        "walker_bp_index": 1,
-        "walker_spawn_index": _SPAWN_A,
-        "walker_target_index": _TARGET_A,
-        "traffic_vehicles": 10,
-        "traffic_walkers": 5,
-        "width": 1280,
-        "height": 720,
-        "fps": 48,
-        "spawn_lead_m": 11.0,
-        "min_window_s": 5.9,
-        "actors": [
-            {"blueprint": "static.prop.warningconstruction", "forward": 13.0, "lateral": -0.6, "z": 1.80, "yaw": 0.0,
-             "boss_class": "insegna_cartello_basso", "physics": False},
-        ],
-    },
+    # Un ramo che esce dal tronco a 2,1 m e attraversa il marciapiede scendendo di
+    # 10 gradi: la parte legnosa resta sopra la testa, le foglie occupano 1,4-2,3 m
+    # proprio sulla linea di marcia. E' un acero giovane (SM_Maple_S_v1) in scala
+    # 0,6 e coricato: il suo fusto fa da ramo e la sua chioma da fronda terminale.
+    # pitch -100 punta il fusto lungo lo yaw, 10 gradi sotto l'orizzontale; yaw +20
+    # lo ruota verso il pedone che arriva.
+    "s2r_ramo": dict(_S2R, n_frames=576, actors=[
+        {"mesh": "Vegetation/Trees/SM_Maple_S_v1.SM_Maple_S_v1", "scale": 0.6,
+         "anchor": "tree", "forward": 14.0, "lateral": -2.0, "z": 2.10,
+         "pitch": -100.0, "yaw": 20.0, "boss_class": "ramo_sporgente", "physics": False},
+    ]),
 
-    "s2r_sospeso_generico": {
-        "map": _TOWN,
-        "weather": "ClearNoon",
-        "n_frames": 480,
-        "seed": 2,
-        "walker_bp_index": 1,
-        "walker_spawn_index": _SPAWN_A,
-        "walker_target_index": _TARGET_A,
-        "traffic_vehicles": 10,
-        "traffic_walkers": 5,
-        "width": 1280,
-        "height": 720,
-        "fps": 48,
-        "spawn_lead_m": 11.0,
-        "min_window_s": 5.9,
-        "actors": [
-            {"blueprint": "static.prop.box02", "forward": 13.0, "lateral": 0.3, "z": 1.60, "yaw": 30.0,
-             "boss_class": "ostacolo_sospeso_generico", "physics": False},
-        ],
-    },
+    # La variante pesante: una fronda di quercia che dallo stesso tronco ricade nel
+    # marciapiede fino all'altezza del petto. A vista sembra un ramo basso dello
+    # stesso albero.
+    "s2r_ramo_fronda": dict(_S2R, n_frames=576, actors=[
+        {"mesh": "Vegetation/Trees/SM_Oak_S_v1.SM_Oak_S_v1", "scale": 0.42,
+         "anchor": "tree", "forward": 14.0, "lateral": -2.0, "z": 2.30,
+         "pitch": -100.0, "yaw": 20.0, "boss_class": "ramo_sporgente", "physics": False},
+    ]),
+
+    # Un cartello di sosta montato di lato sul suo palo, al bordo del marciapiede,
+    # con il bordo basso a 1,60 m: 10 cm sopra gli occhi, all'altezza della fronte.
+    # Il bastone trova il palo, non la lamiera. Palo e cartello sono attori
+    # distinti: la box dell'insegna e' quella del solo cartello (il palo resta Pole,
+    # cioe' palo_della_luce per l'export). La lamiera (0,52 x 0,76 m, origine al
+    # centro) occupa da -0,56 a -0,04 m a sinistra della linea di marcia.
+    "s2r_insegna": dict(_S2R, n_frames=480, actors=[
+        {"mesh": "TrafficSign/TrafficSigns_A1/SM_A01parking.SM_A01parking",
+         "forward": 11.0, "lateral": -0.30, "z": 1.98, "yaw": 90.0,
+         "support": {"mesh": "Pole/SM_RoadSigns01.SM_RoadSigns01",
+                     "forward": 0.0, "lateral": -0.30, "z": 0.0},
+         "boss_class": "insegna_cartello_basso", "physics": False},
+    ]),
+
+    # Una cassetta (quadro tecnico, cassetta postale) montata su un palo a
+    # 1,24-1,76 m, che sporge verso la linea di marcia fino a 0,24 m dal centro del
+    # pedone: all'altezza della spalla. Il palo (RoadSigns01) e' interrato di 0,55 m
+    # per finire dentro la cassetta.
+    "s2r_sospeso_generico": dict(_S2R, n_frames=480, actors=[
+        {"mesh": "Building/Building_pieces/props/AirConditioner/"
+                 "SM_Prop_001_AirConditioner_001.SM_Prop_001_AirConditioner_001",
+         "forward": 12.0, "lateral": -0.60, "z": 1.50, "yaw": 90.0,
+         "support": {"mesh": "Pole/SM_RoadSigns01.SM_RoadSigns01",
+                     "forward": 0.0, "lateral": -0.05, "z": -0.55},
+         "boss_class": "ostacolo_sospeso_generico", "physics": False},
+    ]),
+
+    # Priorita' "mezzi silenziosi": un monopattino elettrico a 25 km/h che arriva
+    # incontro al pedone SULLA SUA LINEA DI MARCIA, e schiva all'ultimo passandogli a
+    # 0,9 m sulla destra (lato facciate, il piu' libero). Parte a 60 m: con 8,3 m/s
+    # di avvicinamento resta in vista ~7 s, piu' dei 5,9 s di A8, e a 60 m e' ancora
+    # ~22 px di altezza. Nessun pedone NPC: starebbero proprio sulla linea di vista.
+    #
+    # Il catalogo di CARLA non ha monopattini: e' composto (scene_actors.ApproachingRider).
+    # Conducente in piedi e fermo, che trasla senza camminare; asta e manubrio da un
+    # palo di cartello in scala; pedana da un cartone piatto; ruote da due piatti da
+    # 18 cm messi di taglio. dx avanti nel verso di marcia, dy a destra, z dal suolo.
+    "s2r_monopattino": dict(_S2R, n_frames=480, traffic_walkers=0, actors=[], movers=[
+        {"kind": "approaching_rider", "boss_class": "monopattino",
+         "rider": "walker.pedestrian.0026",
+         "forward": 60.0, "lateral": 0.0, "speed_kmh": 25.0,
+         "pass_lateral": 0.9, "swerve_from_m": 9.0, "swerve_to_m": 3.0,
+         "deck_top_m": 0.135,
+         "parts": [
+             {"part": "pedana", "mesh": "Dynamic/Trash/SM_CreasedBox02.SM_CreasedBox02",
+              "scale": 0.33, "dx": 0.0, "dy": 0.0, "z": 0.065},
+             {"part": "asta", "mesh": "Pole/SM_RoadSigns01.SM_RoadSigns01",
+              "scale": 0.5, "dx": 0.35, "dy": 0.0, "z": 0.10, "pitch": 5.0},
+             {"part": "manubrio", "mesh": "Pole/SM_RoadSigns01.SM_RoadSigns01",
+              "scale": 0.22, "dx": 0.25, "dy": -0.26, "z": 1.20, "roll": 90.0},
+             {"part": "ruota_anteriore", "mesh": "Dynamic/Bar-Restaurant/SM_Plate.SM_Plate",
+              "scale": 1.1, "dx": 0.36, "dy": 0.0, "z": 0.10, "roll": 90.0},
+             {"part": "ruota_posteriore", "mesh": "Dynamic/Bar-Restaurant/SM_Plate.SM_Plate",
+              "scale": 1.1, "dx": -0.30, "dy": 0.0, "z": 0.10, "roll": 90.0},
+         ]},
+    ]),
 }

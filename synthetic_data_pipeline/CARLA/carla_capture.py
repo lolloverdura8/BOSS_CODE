@@ -19,6 +19,11 @@
 #   CarlaUE4.exe -RenderOffScreen -quality-level=Low
 # La qualita' bassa e' legittima (par. 5.0): nel ramo Sim2Real l'aspetto viene
 # rigenerato dal modello video, a CARLA si chiede geometria ed etichette esatte.
+#
+# Dal 05/10 il lavoro e' diviso in tre moduli: qui la sessione (mondo, pedone,
+# sensori, scrittura), in scene_actors.py la costruzione degli ostacoli e del mezzo
+# in arrivo, in acceptance.py i controlli A1-A9, che non importano carla e si
+# rieseguono su una sessione gia' registrata.
 import argparse
 import hashlib
 import json
@@ -26,6 +31,7 @@ import math
 import os
 import queue
 import random
+import subprocess
 import sys
 import time
 from collections import deque
@@ -36,8 +42,12 @@ import numpy as np
 
 import carla
 
-from boss_classes import BOSS_CLASS_BY_NAME, CARLA_TAG_NAMES, TAG_SKY
+from acceptance import print_acceptance, run_acceptance_checks, write_acceptance
+from boss_classes import BOSS_CLASS_BY_NAME, CARLA_TAG_NAMES
 from scenarios import SCENARIOS
+from scene_actors import (ApproachingRider, place_obstacle, resolve_blueprint, spec_label,
+                          transform_to_dict, tree_trunks, validate_meshes,
+                          walker_origin_above_feet)
 
 HOST, PORT = "localhost", 2000
 CLIENT_TIMEOUT_S = 20.0
@@ -120,10 +130,28 @@ PROGRESS_EVERY = 25
 # perche' gli scenari Sim2Real girano a 48 Hz, dove 8 tick sarebbero 0,17 s.
 DIRECTION_WINDOW_S = 0.5
 
-# Controlli di accettazione: parametri.
-A3_SAMPLE_FRAMES = 20       # frame campionati per le verifiche statistiche
-A4_SKY_TOLERANCE = 0.99     # quota minima di pixel di cielo che deve stare al massimo
-A7_MIN_FRAMES = 10          # in quanti frame almeno un attore tracciato deve essere visibile
+# Sotto questo spostamento nella finestra di direzione la stima e' rumore di posa,
+# non moto: si tiene la stima precedente invece di aggiornarla.
+HEADING_MIN_MOTION_M = 0.05
+
+# Chiavi ammesse negli scenari e nelle loro dichiarazioni. Si controllano tutte,
+# anche le facoltative: un refuso in "fps" o in "min_window_s" non solleverebbe
+# nulla, ma registrerebbe a 1008x756 e 16 Hz o spegnerebbe A8 (revisione 05/10).
+SCENARIO_KEYS = {"map", "weather", "wind_intensity", "n_frames", "seed", "walker_bp_index",
+                 "walker_spawn_index", "walker_target_index", "traffic_vehicles",
+                 "traffic_walkers", "width", "height", "fps", "spawn_lead_m", "min_window_s",
+                 "place_at_start", "actors", "movers"}
+ACTOR_KEYS = {"blueprint", "mesh", "scale", "forward", "lateral", "z", "yaw", "pitch", "roll",
+              "boss_class", "physics", "anchor", "support"}
+ACTOR_REQUIRED = ("forward", "lateral", "z", "yaw", "boss_class", "physics")
+SUPPORT_KEYS = {"blueprint", "mesh", "scale", "forward", "lateral", "z", "yaw"}
+SUPPORT_REQUIRED = ("forward", "lateral", "z")
+MOVER_KEYS = {"kind", "group", "boss_class", "rider", "forward", "lateral", "speed_kmh",
+              "pass_lateral", "swerve_from_m", "swerve_to_m", "deck_top_m", "parts"}
+PART_KEYS = {"part", "mesh", "scale", "dx", "dy", "z", "pitch", "yaw", "roll"}
+PART_REQUIRED = ("part", "mesh", "dx", "dy", "z")
+# La geometria Sim2Real si dichiara tutta insieme o per niente.
+S2R_KEYS = ("width", "height", "fps", "min_window_s")
 
 
 # --- utilita' di basso livello ----------------------------------------------
@@ -189,13 +217,6 @@ def capture_geometry(scenario):
     }
 
 
-def transform_to_dict(tf):
-    return {
-        "location": {"x": tf.location.x, "y": tf.location.y, "z": tf.location.z},
-        "rotation": {"pitch": tf.rotation.pitch, "yaw": tf.rotation.yaw, "roll": tf.rotation.roll},
-    }
-
-
 def check_versions(client):
     """R1: client e server devono essere della stessa identica versione.
 
@@ -210,36 +231,77 @@ def check_versions(client):
     return cv_
 
 
-def resolve_blueprint(library, bp_id):
-    """Trova un blueprint, oppure si ferma stampando i candidati simili.
+def _check_keys(what, spec, allowed, required=()):
+    unknown = sorted(set(spec) - allowed)
+    if unknown:
+        sys.exit("chiavi sconosciute in %s: %s (ammesse: %s)" % (what, unknown, sorted(allowed)))
+    missing = [k for k in required if k not in spec]
+    if missing:
+        sys.exit("chiavi mancanti in %s: %s" % (what, missing))
 
-    L'inventario degli asset cambia fra versioni e fra installazioni (par. 5.2):
-    invece di assumere che gli id dello scenario esistano, li si verifica tutti
-    prima di registrare. Senza questo controllo un id sbagliato non produce una
-    scena mancante ma una scena diversa, e ce ne si accorge a sessione finita.
-    """
-    try:
-        return library.find(bp_id)
-    except (IndexError, RuntimeError):
-        pass
-    family = bp_id.rsplit(".", 1)[0]
-    candidates = sorted(b.id for b in library.filter(family + ".*"))
-    print("blueprint non trovato: %s" % bp_id, file=sys.stderr)
-    if candidates:
-        print("candidati nella famiglia %s.* su questa installazione:" % family, file=sys.stderr)
-        for c in candidates:
-            print("   %s" % c, file=sys.stderr)
-    else:
-        print("nessun blueprint nella famiglia %s.*" % family, file=sys.stderr)
-    sys.exit("scenario non eseguibile: correggere scenarios.py")
+
+def _check_class(name):
+    if name not in BOSS_CLASS_BY_NAME:
+        sys.exit("classe BOSS sconosciuta nello scenario: %s" % name)
+
+
+def _check_source(what, spec, library):
+    """Un attore viene o da un blueprint del catalogo o da una mesh: uno dei due, non entrambi."""
+    if ("blueprint" in spec) == ("mesh" in spec):
+        sys.exit("%s deve dichiarare esattamente uno fra blueprint e mesh: %s" % (what, spec))
+    if "blueprint" in spec:
+        resolve_blueprint(library, spec["blueprint"])
 
 
 def validate_scenario(scenario, library):
-    """Verifica blueprint e classi BOSS dello scenario prima di toccare il mondo."""
+    """Verifica chiavi, blueprint e classi BOSS dello scenario prima di toccare il mondo.
+
+    Le mesh si verificano dopo, con validate_meshes(), perche' per farlo servono
+    degli spawn di prova.
+    """
+    _check_keys("scenario", scenario, SCENARIO_KEYS)
+    declared = [k for k in S2R_KEYS if k in scenario]
+    if declared and len(declared) != len(S2R_KEYS):
+        sys.exit("scenario Sim2Real incompleto: dichiara %s ma non %s"
+                 % (declared, [k for k in S2R_KEYS if k not in scenario]))
     for spec in scenario["actors"]:
-        resolve_blueprint(library, spec["blueprint"])
-        if spec["boss_class"] not in BOSS_CLASS_BY_NAME:
-            sys.exit("classe BOSS sconosciuta nello scenario: %s" % spec["boss_class"])
+        _check_keys("ostacolo", spec, ACTOR_KEYS, ACTOR_REQUIRED)
+        _check_source("ostacolo", spec, library)
+        _check_class(spec["boss_class"])
+        if spec.get("anchor") not in (None, "tree"):
+            sys.exit("ancoraggio sconosciuto: %s (ammesso: tree)" % spec["anchor"])
+        if "support" in spec:
+            _check_keys("sostegno", spec["support"], SUPPORT_KEYS, SUPPORT_REQUIRED)
+            _check_source("sostegno", spec["support"], library)
+    movers = scenario.get("movers", [])
+    if movers and not scenario.get("place_at_start"):
+        sys.exit("i mezzi in movimento si piazzano solo con place_at_start")
+    for mover in movers:
+        _check_keys("mezzo", mover, MOVER_KEYS, tuple(sorted(MOVER_KEYS - {"group"})))
+        if mover["kind"] != "approaching_rider":
+            sys.exit("tipo di mezzo sconosciuto: %s" % mover["kind"])
+        if mover["swerve_from_m"] <= mover["swerve_to_m"]:
+            sys.exit("swerve_from_m deve superare swerve_to_m: %s" % mover)
+        resolve_blueprint(library, mover["rider"])
+        _check_class(mover["boss_class"])
+        for part in mover["parts"]:
+            _check_keys("pezzo del mezzo", part, PART_KEYS, PART_REQUIRED)
+
+
+def code_version():
+    """Il commit del codice che registra (git describe), o None fuori da un checkout.
+
+    Senza, una sessione non dice con quale versione di questo script e' nata: le
+    sessioni del set di valutazione hanno spawn_lead_m 3,0 mentre il codice ha 5,0,
+    e nulla nel file lo spiegava (revisione 05/10).
+    """
+    try:
+        done = subprocess.run(["git", "describe", "--always", "--dirty"],
+                              cwd=os.path.dirname(os.path.abspath(__file__)),
+                              capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() or None
 
 
 # --- costruzione della scena -------------------------------------------------
@@ -278,48 +340,6 @@ def path_frame(spawn_loc, target_loc):
     return (fx, fy), (-fy, fx), math.degrees(math.atan2(fy, fx))
 
 
-def spawn_one_actor(world, library, spec, loc, yaw):
-    """Spawna un singolo ostacolo dello scenario nella posizione e nell'orientamento dati.
-
-    Ogni attore riceve la classe BOSS dichiarata nello scenario. E' questo, non il
-    tag semantico, cio' che rende utilizzabili gli ostacoli personalizzati
-    (par. 5.4): un prop spawnato porta il tag della sua mesh - tipicamente Static
-    (20) o Other (22) - e mai una classe BOSS.
-
-    Restituisce None se lo spawn fallisce (collisione con la geometria della
-    mappa): il chiamante decide se e' fatale o se la classe resta scoperta.
-    """
-    bp = resolve_blueprint(library, spec["blueprint"])
-    tf = carla.Transform(loc, carla.Rotation(yaw=yaw + spec["yaw"]))
-    actor = world.try_spawn_actor(bp, tf)
-    if actor is None:
-        print("ATTENZIONE: spawn fallito per %s (%s): collisione con la geometria"
-              " della mappa. La classe %s restera' scoperta in questa sessione."
-              % (spec["blueprint"], spec["boss_class"], spec["boss_class"]),
-              file=sys.stderr)
-        return None
-    if not spec["physics"]:
-        # R6: senza questo gli ostacoli sospesi cadono al primo tick.
-        actor.set_simulate_physics(False)
-    return {
-        "actor_id": actor.id,
-        # L'instance segmentation codifica l'identita' su 16 bit fra i canali G e B
-        # dell'immagine (R e' il tag semantico). La doc ufficiale descrive la
-        # ricomposizione come (G<<8)|B, ma su questa installazione (0.9.16) la
-        # verifica empirica su due prop spawnati (confronto actor.id noto contro i
-        # pixel effettivamente renderizzati) mostra il contrario: (B<<8)|G, canale
-        # B byte alto. Questo e' il valore, non actor.id, che si legge
-        # dall'immagine - vedi run_acceptance_checks() piu' sotto e la stessa
-        # formula in carla_export.py, che deve restare identica a questa.
-        "instance_id": actor.id & 0xFFFF,
-        "blueprint": spec["blueprint"],
-        "boss_class": spec["boss_class"],
-        "boss_class_id": BOSS_CLASS_BY_NAME[spec["boss_class"]]["id"],
-        "transform": transform_to_dict(tf),
-        "_actor": actor,
-    }
-
-
 def spawn_traffic(world, library, traffic_manager, n_vehicles, n_walkers, excluded_bps):
     """Traffico NPC di contorno: fornisce le istanze delle classi native da tag.
 
@@ -327,7 +347,8 @@ def spawn_traffic(world, library, traffic_manager, n_vehicles, n_walkers, exclud
     non lo fossero, lo stesso identico modello comparirebbe nella stessa sessione
     una volta come veicolo_elettrico_silenzioso (per override sull'id) e una volta
     come automobile (per tag): una ground truth che contraddice se' stessa nello
-    stesso frame, e nessun controllo strutturale se ne accorgerebbe.
+    stesso frame, e nessun controllo strutturale se ne accorgerebbe. Vale anche per
+    i pedoni: il modello del conducente del monopattino non gira come NPC.
     """
     actors = []
     spawn_points = world.get_map().get_spawn_points()
@@ -342,7 +363,7 @@ def spawn_traffic(world, library, traffic_manager, n_vehicles, n_walkers, exclud
             v.set_autopilot(True, traffic_manager.get_port())
             actors.append(v)
 
-    walker_bps = library.filter("walker.pedestrian.*")
+    walker_bps = [b for b in library.filter("walker.pedestrian.*") if b.id not in excluded_bps]
     controller_bp = library.find("controller.ai.walker")
     walkers, controllers = [], []
     for _ in range(n_walkers):
@@ -365,22 +386,6 @@ def spawn_traffic(world, library, traffic_manager, n_vehicles, n_walkers, exclud
             c.go_to_location(target)
         c.set_max_speed(WALKER_SPEED)
     return actors + walkers + controllers
-
-
-def walker_origin_above_feet(walker):
-    """Quanto l'origine dell'attore pedone sta sopra i suoi stessi piedi, in metri.
-
-    L'origine non e' ai piedi ma al centro della capsula fisica (misurato: con un
-    offset relativo fisso la camera finiva a ~2,6 m dal suolo invece dei 1,5 m di
-    torace/testa richiesti dal par. 5.6, e un prop piazzato a walker.z + 0 finiva
-    a ~1,1 m di altezza invece che a terra). Si ricava dalla bounding box
-    dell'attore, generica per qualunque blueprint pedone: la quota dei piedi
-    rispetto all'origine e' bb.location.z - bb.extent.z, quindi l'origine sta
-    sopra i piedi di bb.extent.z - bb.location.z. Va sottratta ovunque nel codice
-    si usi walker.get_transform().location.z come se fosse la quota del suolo.
-    """
-    bb = walker.bounding_box
-    return bb.extent.z - bb.location.z
 
 
 def build_sensors(world, library, parent, origin_above_feet, width, height):
@@ -443,11 +448,160 @@ def pull_synced_frame(queues, expected_frame):
 
 # --- cattura -----------------------------------------------------------------
 
+class SceneLog:
+    """Cio' che lo scenario ha messo nel mondo, e cosa ne e' stato.
+
+    Un attore spawnato dopo world.tick() non e' nelle immagini di quel tick: compare
+    dal tick successivo. Per questo entra in `fresh` e passa in `tracked` solo al
+    giro dopo (promote). Prima entrava subito, e la prima distanza registrata era
+    quella dall'origine del mondo, un frame prima del suo primo pixel (misurato su
+    8 attori di 3 sessioni, revisione 05/10).
+    """
+
+    def __init__(self):
+        self.entries = []      # spawned_actors di session.json
+        self.fresh = []        # spawnati in questo giro: nei frame dal prossimo tick
+        self.tracked = []      # (actor_id, actor) presenti nei frame
+        self.failures = []     # spawn_failures di session.json
+        self.actors = []       # tutti gli attori dello scenario, da distruggere alla fine
+        self.movers = []       # (ApproachingRider, tick dello spawn)
+
+    def add(self, entries, actors):
+        self.entries.extend(entries)
+        self.fresh.extend(entries)
+        self.actors.extend(actors)
+
+    def fail(self, spec, reason):
+        self.failures.append({"boss_class": spec["boss_class"],
+                              "declared": spec.get("rider") or spec_label(spec),
+                              "reason": reason})
+
+    def promote(self):
+        for entry in self.fresh:
+            actor = entry["_actor"]
+            # La posa vera dopo il primo tick, non quella chiesta allo spawn.
+            entry["transform"] = transform_to_dict(actor.get_transform())
+            self.tracked.append((entry["actor_id"], actor))
+        self.fresh = []
+
+
+def heading_estimate(recent_locs, current):
+    """Direzione di marcia dalla traiettoria recente, oppure la stima precedente.
+
+    Non si assume che rotation.yaw del pedone segua il moto (comportamento interno
+    non documentato): si usa lo spostamento effettivo nella finestra.
+    """
+    ref, cur = recent_locs[0], recent_locs[-1]
+    dx, dy = cur.x - ref.x, cur.y - ref.y
+    norm = math.hypot(dx, dy)
+    if norm <= HEADING_MIN_MOTION_M:
+        return current
+    fx, fy = dx / norm, dy / norm
+    return (fx, fy), (-fy, fx), math.degrees(math.atan2(fy, fx))
+
+
+def placement_frame(cur_loc, origin_above_feet, heading):
+    """Il sistema in cui si piazzano gli ostacoli: posizione, suolo e direzione del pedone."""
+    fwd, _, yaw = heading
+    return {"origin": (cur_loc.x, cur_loc.y), "ground_z": cur_loc.z - origin_above_feet,
+            "fwd": fwd, "yaw": yaw}
+
+
+def place_one(world, library, spec, frame, ahead, trunks, log, fatal):
+    """Piazza un ostacolo dichiarato e lo registra; un fallimento e' fatale se fatal."""
+    entry, created, reason = place_obstacle(world, library, spec, frame, ahead, trunks)
+    if entry is None:
+        log.fail(spec, reason)
+        if fatal:
+            sys.exit("spawn fallito (%s): %s. In uno scenario Sim2Real un ostacolo mancante"
+                     " rende inutile la sessione: ci si ferma qui." % (spec["boss_class"], reason))
+        print("ATTENZIONE: spawn fallito (%s): %s. La classe restera' scoperta in questa"
+              " sessione, e A7 la segnalera'." % (spec["boss_class"], reason), file=sys.stderr)
+        return
+    log.add([entry], created)
+    loc = entry["transform"]["location"]
+    where = ("ancorato al tronco (%.2f, %.2f)" % (entry["anchor"]["trunk"]["x"], entry["anchor"]["trunk"]["y"])
+             if "anchor" in entry else "a %.1f m avanti" % ahead)
+    print("ostacolo %s: %s a (%.2f, %.2f, %.2f), %s"
+          % (spec["boss_class"], spec_label(spec), loc["x"], loc["y"], loc["z"], where))
+
+
+def place_at_start(world, library, scenario, frame, trunks, log, fixed_delta, tick_index):
+    """Scenari Sim2Real: tutti gli ostacoli e i mezzi a "forward" metri dal pedone, subito.
+
+    Si fa all'ultimo tick di warmup: gli attori compaiono dal frame 0, senza il
+    pop-in che A8 deve escludere, e "forward" e' la distanza al frame 0.
+    """
+    for spec in scenario["actors"]:
+        place_one(world, library, spec, frame, spec["forward"], trunks, log, fatal=True)
+    for i, spec in enumerate(scenario.get("movers", [])):
+        group = spec.get("group") or "%s_%d" % (spec["boss_class"], i)
+        mover = ApproachingRider(spec, frame, fixed_delta, group)
+        reason = mover.spawn(world, library, frame["origin"])
+        log.actors.extend(mover.actors())
+        if reason is not None:
+            log.fail(spec, reason)
+            sys.exit("spawn fallito (%s): %s" % (spec["boss_class"], reason))
+        log.add(mover.entries, [])
+        log.movers.append((mover, tick_index))
+        print("mezzo %s: %d attori, parte a %.0f m a %.0f km/h"
+              % (group, len(mover.entries), spec["forward"], spec["speed_kmh"]))
+
+
+def write_png(path, image, digest=None):
+    """Codifica PNG, aggiorna l'hash e scrive: un errore di scrittura non passa in silenzio."""
+    ok, buf = cv2.imencode(".png", image)
+    if not ok:
+        sys.exit("codifica PNG fallita: %s" % path)
+    data = buf.tobytes()
+    if digest is not None:
+        digest.update(data)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def record_frame(out_dir, idx, images, hashes):
+    stem = "%06d.png" % idx
+    write_png(os.path.join(out_dir, "rgb", stem), to_bgra(images["rgb"])[:, :, :3], hashes["rgb"])
+    write_png(os.path.join(out_dir, "depth", stem), decode_depth_mm(images["depth"]), hashes["depth"])
+    # Semantic e instance si salvano come BGR grezzo, senza convertitore di colore:
+    # il tag sta nel canale rosso e l'identita' in G e B, e applicare la
+    # CityScapesPalette li distruggerebbe entrambi.
+    write_png(os.path.join(out_dir, "semantic", stem), to_bgra(images["semantic"])[:, :, :3])
+    write_png(os.path.join(out_dir, "instance", stem), to_bgra(images["instance"])[:, :, :3],
+              hashes["instance"])
+
+
+def pose_record(idx, frame_id, images, cam_tf, tracked):
+    """La riga di poses.jsonl di un frame."""
+    # Distanza camera-attore dall'aritmetica delle trasformazioni. Non viola R10: non
+    # e' una distanza per box ricavata dalla depth, ma la seconda strada esatta del
+    # par. 5.5, che serve come controprova indipendente dell'export. E' euclidea
+    # fino all'origine dell'attore, non la profondita' z dell'export.
+    distances, locations = {}, {}
+    for aid, act in tracked:
+        loc = act.get_transform().location
+        distances[str(aid)] = cam_tf.location.distance(loc)
+        locations[str(aid)] = [loc.x, loc.y, loc.z]
+    return {
+        "index": idx,
+        "frame": frame_id,
+        "timestamp": images["rgb"].timestamp,
+        "frames": dict((k, v.frame) for k, v in images.items()),
+        "camera": transform_to_dict(cam_tf),
+        "tracked_distances_m": distances,
+        # Posizione per frame di ogni attore tracciato, dallo snapshot dello stesso
+        # tick dei sensori: per il mezzo in movimento e' la GT della traiettoria.
+        "tracked_locations": locations,
+    }
+
+
 def capture(scenario_name, out_dir):
     scenario = SCENARIOS[scenario_name]
     geom = capture_geometry(scenario)
     warmup_ticks = geom["warmup_ticks"]
     spawn_lead_m = geom["spawn_lead_m"]
+    at_start = bool(scenario.get("place_at_start"))
 
     client = carla.Client(HOST, PORT)
     client.set_timeout(CLIENT_TIMEOUT_S)
@@ -456,10 +610,14 @@ def capture(scenario_name, out_dir):
     world = client.load_world(scenario["map"])
     library = world.get_blueprint_library()
     validate_scenario(scenario, library)
+    validate_meshes(world, library, scenario)
+    anchored = any(s.get("anchor") == "tree" for s in scenario["actors"])
+    trunks = tree_trunks(world) if anchored else []
 
     original_settings = world.get_settings()
     traffic_manager = client.get_trafficmanager()
-    sensors, extra_actors, scenario_actors = {}, [], []
+    sensors, extra_actors = {}, []
+    log = SceneLog()
 
     try:
         # R8: determinismo. I semi vanno fissati PRIMA di qualunque spawn, e quello
@@ -492,6 +650,14 @@ def capture(scenario_name, out_dir):
         fwd, right, base_yaw = path_frame(spawn_loc, target_loc)
 
         world.set_weather(getattr(carla.WeatherParameters, scenario["weather"]))
+        if "wind_intensity" in scenario:
+            # Il vento muove le foglie con una fase che dipende dal tempo del mondo, non
+            # riproducibile: due catture identiche differivano sul 2,5-6 % della depth,
+            # quasi tutto vegetazione (revisione 05/10). Per i rami, a vento zero la
+            # sessione si ripete e la chioma non trema fra un frame e l'altro.
+            weather = world.get_weather()
+            weather.wind_intensity = float(scenario["wind_intensity"])
+            world.set_weather(weather)
 
         walker_bps = library.filter("walker.pedestrian.*")
         walker_bp = walker_bps[scenario["walker_bp_index"] % len(walker_bps)]
@@ -524,10 +690,11 @@ def capture(scenario_name, out_dir):
         controller.go_to_location(target_loc)
         controller.set_max_speed(WALKER_SPEED)
 
+        excluded = set(s["blueprint"] for s in scenario["actors"] if "blueprint" in s)
+        excluded |= set(m["rider"] for m in scenario.get("movers", []))
         extra_actors.extend(spawn_traffic(world, library, traffic_manager,
                                           scenario["traffic_vehicles"],
-                                          scenario["traffic_walkers"],
-                                          set(s["blueprint"] for s in scenario["actors"])))
+                                          scenario["traffic_walkers"], excluded))
 
         sensors, queues, camera_tf = build_sensors(world, library, walker, origin_above_feet,
                                                    geom["width"], geom["height"])
@@ -537,42 +704,31 @@ def capture(scenario_name, out_dir):
 
         camera = sensors["rgb"]
 
-        # Gli ostacoli dello scenario si spawnano UNO ALLA VOLTA durante il cammino,
-        # non tutti prima: due sessioni reali hanno mostrato che il controller AI
-        # segue la nav mesh (il marciapiede), che curva entro pochi metri, e
-        # qualunque stima statica di direzione presa all'inizio resta valida solo
-        # vicino a dove e' stata misurata (misurato: a meta' cammino il pedone
-        # passava a 1,5-2 m dal prop ma girato altrove, fuori dal cono di ripresa).
-        #
-        # pending resta la lista degli ostacoli non ancora spawnati; quando la
-        # distanza REALMENTE percorsa (path_distance, non la linea d'aria dal
-        # punto di spawn) raggiunge spec["forward"] - SPAWN_LEAD_M, l'ostacolo
-        # viene piazzato usando la direzione ATTUALE del pedone: l'errore di
-        # estrapolazione si riduce cosi' a pochi metri invece che all'intera
-        # distanza del prop, indipendentemente da quanto il percorso curva.
-        pending = list(scenario["actors"])
-        scenario_actors = []
-        tracked = []
+        # Due modi di piazzare gli ostacoli. Negli scenari Sim2Real (place_at_start)
+        # tutti insieme all'ultimo tick di warmup, a "forward" metri dal pedone. Negli
+        # altri UNO ALLA VOLTA durante il cammino: il controller AI segue la nav mesh,
+        # che curva entro pochi metri, e qualunque stima statica di direzione presa
+        # all'inizio resta valida solo vicino a dove e' stata misurata (misurato: a
+        # meta' cammino il pedone passava a 1,5-2 m dal prop ma girato altrove).
+        # Ogni ostacolo si piazza quando la distanza REALMENTE percorsa raggiunge
+        # spec["forward"] - SPAWN_LEAD_M, con la direzione ATTUALE del pedone.
+        pending = [] if at_start else list(scenario["actors"])
+        placed = not at_start
         path_distance = 0.0
         last_loc = walker.get_transform().location
         # Finestra di posizioni recenti per stimare la direzione dalla traiettoria
-        # effettiva, senza assumere che rotation.yaw del pedone segua il moto
-        # (comportamento interno non documentato): 0,5 s (DIRECTION_WINDOW_S, 8
-        # tick a 16 Hz, 24 a 48 Hz) bastano a mediare il rumore tick-per-tick
-        # restando comunque locali nel tempo.
+        # effettiva: 0,5 s (DIRECTION_WINDOW_S, 8 tick a 16 Hz, 24 a 48 Hz) bastano a
+        # mediare il rumore tick-per-tick restando comunque locali nel tempo.
         recent_locs = deque(maxlen=geom["direction_window"])
         recent_locs.append(last_loc)
-        # Stima di riserva finche' la finestra non e' stabile, o se un ostacolo
-        # resta ancora da piazzare a fine sessione (fallback dopo il ciclo, dove
-        # cur_loc resta quello dell'ultimo tick eseguito): la direzione naive
+        # Stima di riserva finche' la finestra non e' stabile: la direzione naive
         # spawn->target e' comunque meglio di niente.
-        cur_fwd, cur_right, cur_yaw = fwd, right, base_yaw
+        heading = (fwd, right, base_yaw)
         cur_loc = last_loc
 
-        # A6: l'hash si accumula sui byte PNG mentre vengono scritti, cosi'
-        # session.json resta scritto una volta sola a fine sessione (R7) e non
-        # serve rileggere l'intera cartella per ottenerlo.
-        rgb_hash = hashlib.sha256()
+        # A6: gli hash si accumulano sui byte PNG mentre vengono scritti, cosi'
+        # session.json resta scritto una volta sola a fine sessione (R7).
+        hashes = {"rgb": hashlib.sha256(), "depth": hashlib.sha256(), "instance": hashlib.sha256()}
 
         n_frames = scenario["n_frames"]
         poses_path = os.path.join(out_dir, "poses.jsonl")
@@ -582,93 +738,52 @@ def capture(scenario_name, out_dir):
         with open(poses_path, "w") as poses:
             for tick_index in range(warmup_ticks + n_frames):
                 expected = world.tick()
+                log.promote()
 
                 cur_loc = walker.get_transform().location
                 path_distance += last_loc.distance(cur_loc)
                 last_loc = cur_loc
                 recent_locs.append(cur_loc)
+                window_full = len(recent_locs) == recent_locs.maxlen
 
-                # Si valuta lo spawn dei prop solo a warmup concluso e con la
-                # finestra di posizioni recenti piena. Misurato (silent_vehicles,
-                # prop a forward=5,0 m): subito dopo start()/go_to_location() il
-                # controller AI puo' ruotare sul posto verso il target prima di
-                # avviare la locomozione vera; se il trigger cade in quella fase la
-                # stima di direzione e' presa su uno spostamento piccolo e quasi
-                # casuale (errore osservato: 70 gradi), e il prop finisce fuori dal
-                # cono di ripresa per l'intera sessione. Il WARMUP_TICKS esiste gia'
-                # per LOD/meteo (par. 14): qui in piu' garantisce che il pedone
-                # cammini per davvero prima che qualunque prop venga piazzato.
-                if pending and tick_index >= warmup_ticks and len(recent_locs) == recent_locs.maxlen:
-                    ref_loc = recent_locs[0]
-                    dx, dy = cur_loc.x - ref_loc.x, cur_loc.y - ref_loc.y
-                    norm = math.hypot(dx, dy)
-                    # Sotto pochi centimetri la direzione e' rumore di posa, non
-                    # moto: si tiene la stima precedente invece di aggiornarla.
-                    if norm > 0.05:
-                        fx, fy = dx / norm, dy / norm
-                        cur_fwd, cur_right = (fx, fy), (-fy, fx)
-                        cur_yaw = math.degrees(math.atan2(fy, fx))
-
+                if not placed and tick_index == warmup_ticks - 1:
+                    if not window_full:
+                        sys.exit("warmup piu' corto della finestra di direzione: impossibile"
+                                 " stimare la marcia prima di piazzare gli ostacoli")
+                    heading = heading_estimate(recent_locs, heading)
+                    frame = placement_frame(cur_loc, origin_above_feet, heading)
+                    place_at_start(world, library, scenario, frame, trunks, log,
+                                   geom["fixed_delta"], tick_index)
+                    placed = True
+                # Si valuta lo spawn dei prop solo a warmup concluso e con la finestra
+                # piena. Misurato (silent_vehicles, prop a forward=5,0 m): subito dopo
+                # start()/go_to_location() il controller AI puo' ruotare sul posto
+                # prima di camminare; un trigger in quella fase prende la direzione da
+                # uno spostamento quasi casuale (errore osservato: 70 gradi).
+                elif pending and tick_index >= warmup_ticks and window_full:
+                    heading = heading_estimate(recent_locs, heading)
+                    frame = placement_frame(cur_loc, origin_above_feet, heading)
                     still_pending = []
                     for spec in pending:
                         if path_distance < spec["forward"] - spawn_lead_m:
                             still_pending.append(spec)
                             continue
-                        loc = carla.Location(
-                            x=cur_loc.x + cur_fwd[0] * spawn_lead_m + cur_right[0] * spec["lateral"],
-                            y=cur_loc.y + cur_fwd[1] * spawn_lead_m + cur_right[1] * spec["lateral"],
-                            z=(cur_loc.z - origin_above_feet) + spec["z"],
-                        )
-                        result = spawn_one_actor(world, library, spec, loc, cur_yaw)
-                        if result is not None:
-                            scenario_actors.append(result)
-                            extra_actors.append(result["_actor"])
-                            tracked.append((result["actor_id"], result["_actor"]))
+                        place_one(world, library, spec, frame, spawn_lead_m, trunks, log, fatal=False)
                     pending = still_pending
+
+                # La posa comandata ora viene resa al prossimo tick: il frame k+1
+                # mostra il mezzo dopo k tick di moto, alla velocita' dichiarata.
+                for mover, spawn_tick in log.movers:
+                    mover.update(tick_index - spawn_tick, (cur_loc.x, cur_loc.y))
 
                 images = pull_synced_frame(queues, expected)
                 if tick_index < warmup_ticks:
                     continue
 
                 idx = tick_index - warmup_ticks
-                stem = "%06d.png" % idx
-
-                ok, buf = cv2.imencode(".png", to_bgra(images["rgb"])[:, :, :3])
-                if not ok:
-                    sys.exit("codifica PNG dell'RGB fallita al frame %d" % idx)
-                raw_png = buf.tobytes()
-                rgb_hash.update(raw_png)
-                with open(os.path.join(out_dir, "rgb", stem), "wb") as f:
-                    f.write(raw_png)
-
-                cv2.imwrite(os.path.join(out_dir, "depth", stem),
-                            decode_depth_mm(images["depth"]))
-                # Semantic e instance si salvano come BGR grezzo, senza convertitore
-                # di colore: il tag sta nel canale rosso e l'identita' in G e B, e
-                # applicare la CityScapesPalette li distruggerebbe entrambi.
-                cv2.imwrite(os.path.join(out_dir, "semantic", stem),
-                            to_bgra(images["semantic"])[:, :, :3])
-                cv2.imwrite(os.path.join(out_dir, "instance", stem),
-                            to_bgra(images["instance"])[:, :, :3])
-
-                cam_tf = camera.get_transform()
-                # Distanza camera-attore dall'aritmetica delle trasformazioni. Non
-                # viola R10: non e' una distanza per box ricavata dalla depth, ma la
-                # seconda strada esatta del par. 5.5, che serve come controprova
-                # indipendente dell'export. Se le due divergono, il colpevole e' la
-                # scala della depth (R4) o l'allineamento dei sensori (R5).
-                distances = dict(
-                    (str(aid), cam_tf.location.distance(act.get_transform().location))
-                    for aid, act in tracked)
-
-                poses.write(json.dumps({
-                    "index": idx,
-                    "frame": expected,
-                    "timestamp": images["rgb"].timestamp,
-                    "frames": dict((k, v.frame) for k, v in images.items()),
-                    "camera": transform_to_dict(cam_tf),
-                    "tracked_distances_m": distances,
-                }) + "\n")
+                record_frame(out_dir, idx, images, hashes)
+                poses.write(json.dumps(pose_record(idx, expected, images, camera.get_transform(),
+                                                   log.tracked)) + "\n")
                 written += 1
 
                 if idx % PROGRESS_EVERY == 0:
@@ -676,22 +791,15 @@ def capture(scenario_name, out_dir):
 
         # Ostacoli mai raggiunti (il pedone non ha percorso abbastanza strada entro
         # fine sessione): si piazzano comunque, con un avviso, invece di sparire in
-        # silenzio da session.json. cur_loc/cur_fwd/cur_right/cur_yaw sono quelli
-        # dell'ultimo tick registrato nel ciclo sopra.
-        for spec in pending:
-            print("ATTENZIONE: %s non raggiunto entro fine sessione (percorsi %.1f m,"
-                  " ne servivano %.1f): piazzato alla posizione finale del pedone."
-                  % (spec["boss_class"], path_distance, spec["forward"]), file=sys.stderr)
-            loc = carla.Location(
-                x=cur_loc.x + cur_fwd[0] * spawn_lead_m + cur_right[0] * spec["lateral"],
-                y=cur_loc.y + cur_fwd[1] * spawn_lead_m + cur_right[1] * spec["lateral"],
-                z=(cur_loc.z - origin_above_feet) + spec["z"],
-            )
-            result = spawn_one_actor(world, library, spec, loc, cur_yaw)
-            if result is not None:
-                scenario_actors.append(result)
-                extra_actors.append(result["_actor"])
-                tracked.append((result["actor_id"], result["_actor"]))
+        # silenzio da session.json. Non compaiono in nessun frame, e A7 lo dice.
+        if pending:
+            heading = heading_estimate(recent_locs, heading)
+            frame = placement_frame(cur_loc, origin_above_feet, heading)
+            for spec in pending:
+                print("ATTENZIONE: %s non raggiunto entro fine sessione (percorsi %.1f m,"
+                      " ne servivano %.1f): piazzato alla posizione finale del pedone."
+                      % (spec["boss_class"], path_distance, spec["forward"]), file=sys.stderr)
+                place_one(world, library, spec, frame, spawn_lead_m, trunks, log, fatal=False)
 
         elapsed = time.time() - t0
 
@@ -704,8 +812,10 @@ def capture(scenario_name, out_dir):
             "scenario": scenario_name,
             "scenario_config": dict((k, v) for k, v in scenario.items()),
             "carla_version": carla_version,
+            "code_version": code_version(),
             "map": scenario["map"],
             "weather": scenario["weather"],
+            "wind_intensity": scenario.get("wind_intensity"),
             "seed": scenario["seed"],
             "fixed_delta_seconds": geom["fixed_delta"],
             "warmup_ticks": warmup_ticks,
@@ -727,14 +837,18 @@ def capture(scenario_name, out_dir):
             "walker_target": {"x": target_loc.x, "y": target_loc.y, "z": target_loc.z},
             # Distanza REALMENTE percorsa dal pedone (lungo la nav mesh, non in
             # linea d'aria): e' la metrica con cui e' stato deciso quando piazzare
-            # ciascun ostacolo (vedi SPAWN_LEAD_M), non la retta spawn->target, che
-            # serve solo da stima iniziale di riserva.
+            # ciascun ostacolo negli scenari a piazzamento progressivo.
             "path_distance_walked_m": path_distance,
-            "spawn_lead_m": spawn_lead_m,
+            "place_at_start": at_start,
+            "spawn_lead_m": None if at_start else spawn_lead_m,
             "spawned_actors": [dict((k, v) for k, v in a.items() if k != "_actor")
-                               for a in scenario_actors],
+                               for a in log.entries],
+            "spawn_failures": log.failures,
+            "movers": [m.describe() for m, _ in log.movers],
             "n_frames_written": written,
-            "rgb_sha256": rgb_hash.hexdigest(),
+            "rgb_sha256": hashes["rgb"].hexdigest(),
+            "depth_sha256": hashes["depth"].hexdigest(),
+            "instance_sha256": hashes["instance"].hexdigest(),
             "capture_elapsed_s": elapsed,
             "captured_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -750,208 +864,55 @@ def capture(scenario_name, out_dir):
         return out_dir
 
     finally:
-        # R9: la trappola piu' frequente. Se lo script termina male senza questo
-        # blocco, il server resta in modalita' sincrona con nessuno che faccia tick
-        # e la sessione successiva si blocca all'avvio senza spiegazione.
-        #
-        # Il primo giro reale (urban_day, 300 frame) ha mostrato un crash nativo del
-        # client proprio in questo blocco: i dati erano gia' scritti su disco (nessuna
-        # perdita), ma l'uscita non era pulita. E' un problema noto della community
-        # CARLA: distruggere gli attori uno a uno con RPC separate, mentre il traffic
-        # manager li referenzia ancora, senza un tick che faccia processare le
-        # rimozioni al server prima di disattivare la modalita' sincrona. Si adotta lo
-        # stesso pattern degli script ufficiali (PythonAPI/examples/generate_traffic.py):
-        # fermare prima i listener (sensori, controller AI: richiedono stop()
-        # esplicito), distruggere tutto in un solo client.apply_batch invece di N
-        # round-trip separati, poi un tick MENTRE si e' ancora sincroni per far
-        # processare i comandi al server, e solo alla fine disattivare il sync.
-        for s in sensors.values():
-            try:
-                s.stop()
-            except RuntimeError:
-                pass
-        for a in extra_actors:
-            try:
-                if a.type_id.startswith("controller."):
-                    a.stop()
-            except RuntimeError:
-                pass
-
-        to_destroy = list(sensors.values()) + list(reversed(extra_actors))
-        if to_destroy:
-            try:
-                client.apply_batch([carla.command.DestroyActor(a) for a in to_destroy])
-            except RuntimeError:
-                pass
-
-        try:
-            world.tick()
-        except RuntimeError:
-            pass
-
-        try:
-            traffic_manager.set_synchronous_mode(False)
-        except RuntimeError:
-            pass
-        world.apply_settings(original_settings)
+        cleanup(client, world, traffic_manager, sensors, extra_actors + log.actors, original_settings)
 
 
-# --- controlli di accettazione A1-A7 -----------------------------------------
+def cleanup(client, world, traffic_manager, sensors, actors, original_settings):
+    """R9: lasciare il server come lo si e' trovato, anche se la sessione e' fallita.
 
-def run_acceptance_checks(out_dir):
-    """I sette controlli del par. 14.3, da superare tutti prima di usare la sessione.
+    La trappola piu' frequente: se lo script termina male senza questo blocco, il
+    server resta in modalita' sincrona con nessuno che faccia tick e la sessione
+    successiva si blocca all'avvio senza spiegazione.
 
-    Sono verifiche di poche righe che intercettano errori i quali non producono
-    eccezioni: una depth decodificata male e' plausibile all'occhio, e dei flussi
-    disallineati producono file perfettamente validi.
+    Il primo giro reale (urban_day, 300 frame) ha mostrato un crash nativo del client
+    proprio qui: i dati erano gia' scritti su disco, ma l'uscita non era pulita. E' un
+    problema noto della community CARLA: distruggere gli attori uno a uno con RPC
+    separate, mentre il traffic manager li referenzia ancora, senza un tick che faccia
+    processare le rimozioni al server prima di disattivare la modalita' sincrona. Si
+    adotta lo stesso pattern degli script ufficiali (generate_traffic.py): fermare
+    prima i listener (sensori, controller AI), distruggere tutto in un solo
+    client.apply_batch, poi un tick MENTRE si e' ancora sincroni, e solo alla fine
+    disattivare il sync.
     """
-    results = []
+    for s in sensors.values():
+        try:
+            s.stop()
+        except RuntimeError:
+            pass
+    for a in actors:
+        try:
+            if a.type_id.startswith("controller."):
+                a.stop()
+        except RuntimeError:
+            pass
 
-    def record(name, ok, detail):
-        results.append((name, ok, detail))
+    to_destroy = list(sensors.values()) + list(reversed(actors))
+    if to_destroy:
+        try:
+            client.apply_batch([carla.command.DestroyActor(a) for a in to_destroy])
+        except RuntimeError as exc:
+            print("ATTENZIONE: distruzione degli attori non riuscita: %s" % exc, file=sys.stderr)
 
-    session_path = os.path.join(out_dir, "session.json")
-    if not os.path.exists(session_path):
-        record("A5", False, "session.json assente")
-        return results
-    with open(session_path) as f:
-        session = json.load(f)
+    try:
+        world.tick()
+    except RuntimeError:
+        pass
 
-    dirs = ["rgb", "depth", "semantic", "instance"]
-    counts = dict((d, sorted(os.listdir(os.path.join(out_dir, d)))) for d in dirs)
-    with open(os.path.join(out_dir, "poses.jsonl")) as f:
-        poses = [json.loads(l) for l in f if l.strip()]
-
-    n = len(counts["rgb"])
-    a1 = all(len(counts[d]) == n for d in dirs) and len(poses) == n
-    record("A1", a1, "rgb=%d depth=%d semantic=%d instance=%d poses=%d"
-           % (len(counts["rgb"]), len(counts["depth"]), len(counts["semantic"]),
-              len(counts["instance"]), len(poses)))
-
-    bad = [p["index"] for p in poses if len(set(p["frames"].values())) != 1]
-    record("A2", not bad, "ok su %d frame" % len(poses) if not bad
-           else "frame id discordi agli indici %s" % bad[:5])
-
-    step = max(1, n // A3_SAMPLE_FRAMES) if n else 1
-    sample = counts["depth"][::step][:A3_SAMPLE_FRAMES]
-
-    lo_all, hi_all, zeros, sat = [], [], 0, 0
-    for name in sample:
-        d = cv2.imread(os.path.join(out_dir, "depth", name), cv2.IMREAD_UNCHANGED)
-        lo_all.append(float(np.percentile(d, 5)))
-        hi_all.append(float(np.percentile(d, 95)))
-        zeros += int((d == 0).all())
-        sat += int((d == DEPTH_MAX_U16).all())
-    a3 = bool(sample) and zeros == 0 and sat == 0 and max(hi_all) > min(lo_all)
-    record("A3", a3, "p5 min=%.0f mm, p95 max=%.0f mm, frame tutti-zero=%d tutti-saturi=%d"
-           % (min(lo_all) if lo_all else 0, max(hi_all) if hi_all else 0, zeros, sat)
-           if sample else "nessun frame da campionare")
-
-    # A4, invariante cielo: e' il controllo piu' informativo dei sette. Il cielo in
-    # CARLA sta a 1000 m, cioe' ben oltre i 65,5 m rappresentabili: dopo il clip
-    # DEVE valere esattamente 65535. Se non vale, o la decodifica R3 e' sbagliata,
-    # o i flussi sono disallineati (R2/R5), e in entrambi i casi la depth non
-    # descrive l'immagine che le sta accanto.
-    sky_total, sky_ok, frames_with_sky = 0, 0, 0
-    for name in sample:
-        sem = cv2.imread(os.path.join(out_dir, "semantic", name), cv2.IMREAD_UNCHANGED)
-        dep = cv2.imread(os.path.join(out_dir, "depth", name), cv2.IMREAD_UNCHANGED)
-        mask = sem[:, :, 2] == TAG_SKY          # canale rosso: cv2 legge in BGR
-        cnt = int(mask.sum())
-        if cnt == 0:
-            continue
-        frames_with_sky += 1
-        sky_total += cnt
-        sky_ok += int((dep[mask] == DEPTH_MAX_U16).sum())
-    if frames_with_sky == 0:
-        record("A4", False, "nessun pixel di cielo nei frame campionati:"
-                            " controllo non eseguibile, inquadratura da rivedere")
-    else:
-        ratio = sky_ok / float(sky_total)
-        record("A4", ratio >= A4_SKY_TOLERANCE,
-               "%.4f dei pixel di cielo al massimo (soglia %.2f), su %d frame"
-               % (ratio, A4_SKY_TOLERANCE, frames_with_sky))
-
-    required = ["intrinsics", "fov", "width", "height", "depth_scale", "carla_version",
-                "map", "seed", "fixed_delta_seconds", "camera_transform_relative",
-                "spawned_actors", "rgb_sha256"]
-    missing = [k for k in required if k not in session or session[k] is None]
-    record("A5", not missing, "tutti i campi R7 presenti" if not missing
-           else "campi mancanti: %s" % missing)
-
-    # A6 non si chiude in una sola esecuzione: si stampa l'hash e il confronto e'
-    # fra due sessioni registrate con lo stesso seme.
-    record("A6", None, "sha256 RGB = %s (confrontare con una seconda esecuzione"
-                       " dello stesso scenario)" % session["rgb_sha256"])
-
-    tracked = session["spawned_actors"]
-    if not tracked:
-        record("A7", None, "nessun attore tracciato in questo scenario")
-    else:
-        seen = dict((a["instance_id"], 0) for a in tracked)
-        run = dict((a["instance_id"], 0) for a in tracked)
-        best_run = dict((a["instance_id"], 0) for a in tracked)
-        for name in counts["instance"]:
-            inst = cv2.imread(os.path.join(out_dir, "instance", name), cv2.IMREAD_UNCHANGED)
-            # (B<<8)|G, non (G<<8)|B come da doc ufficiale: vedi la nota in
-            # spawn_one_actor(). BGR: B=indice 0 (byte alto), G=indice 1 (byte basso).
-            ids = (inst[:, :, 0].astype(np.uint16) << 8) | inst[:, :, 1]
-            present = set(np.unique(ids).tolist())
-            for iid in seen:
-                if iid in present:
-                    seen[iid] += 1
-                    run[iid] += 1
-                    best_run[iid] = max(best_run[iid], run[iid])
-                else:
-                    run[iid] = 0
-        weak = [(a["boss_class"], a["instance_id"], seen[a["instance_id"]])
-                for a in tracked if seen[a["instance_id"]] < A7_MIN_FRAMES]
-        record("A7", not weak,
-               "tutti i %d attori tracciati visibili in >= %d frame" % (len(tracked), A7_MIN_FRAMES)
-               if not weak else "fuori campo o quasi: %s" % weak)
-
-        # A8, solo per gli scenari Sim2Real: il generatore ridipinge una finestra
-        # CONTIGUA (93 frame a 16 fps per Cosmos), quindi non basta che l'ostacolo
-        # compaia in abbastanza frame in totale come chiede A7. Un buco a meta'
-        # spezzerebbe la clip, e un ostacolo che compare a finestra iniziata
-        # sarebbe un pop-in che nessun video reale contiene.
-        # Limite voluto: "visibile" vuol dire almeno un pixel dell'istanza, come in
-        # A7. Che l'ostacolo sia grande abbastanza da servire lo decide la scelta
-        # della finestra in prepare_controls.py, non questo controllo.
-        min_window_s = session["scenario_config"].get("min_window_s")
-        if min_window_s:
-            need = math.ceil(min_window_s / session["fixed_delta_seconds"])
-            short = [(a["boss_class"], a["instance_id"], best_run[a["instance_id"]])
-                     for a in tracked if best_run[a["instance_id"]] < need]
-            record("A8", not short,
-                   "finestra contigua >= %d frame (%.1f s) per tutti i %d attori"
-                   % (need, min_window_s, len(tracked))
-                   if not short else "finestra contigua troppo corta (servono %d): %s"
-                   % (need, short))
-
-    return results
-
-
-def print_acceptance(results):
-    print("\n--- controlli di accettazione ---")
-    failed = 0
-    for name, ok, detail in results:
-        if ok is None:
-            status = "INFO"
-        elif ok:
-            status = "PASS"
-        else:
-            status = "FAIL"
-            failed += 1
-        print("%-4s %-4s %s" % (name, status, detail))
-    if failed:
-        print("\n%d controlli falliti: la sessione NON e' valida." % failed)
-        if any(n == "A4" and ok is False for n, ok, _ in results):
-            print("A4 fallito e' il segnale piu' forte: rivedere la decodifica della"
-                  " depth (R3) o l'allineamento dei sensori (R2/R5) prima di rigirare.")
-    else:
-        print("\nTutti i controlli eseguibili superati.")
-    return failed
+    try:
+        traffic_manager.set_synchronous_mode(False)
+    except RuntimeError:
+        pass
+    world.apply_settings(original_settings)
 
 
 if __name__ == "__main__":
@@ -969,4 +930,6 @@ if __name__ == "__main__":
     os.makedirs(out, exist_ok=True)
 
     capture(args.scenario, out)
-    sys.exit(1 if print_acceptance(run_acceptance_checks(out)) else 0)
+    results, info = run_acceptance_checks(out)
+    write_acceptance(out, results, info)
+    sys.exit(1 if print_acceptance(results) else 0)

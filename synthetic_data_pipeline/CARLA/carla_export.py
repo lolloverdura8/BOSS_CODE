@@ -79,6 +79,59 @@ def build_override(session):
     return dict((a["instance_id"], a["boss_class"]) for a in session.get("spawned_actors", []))
 
 
+def build_groups(session):
+    """instance_id -> gruppo, per gli oggetti fatti di piu' attori.
+
+    Il monopattino del ramo Sim2Real e' conducente, asta, manubrio, pedana e ruote:
+    cinque attori, cinque id, un oggetto solo. Le sessioni registrate prima del
+    05/10 non hanno gruppi, e la loro esportazione resta identica.
+    """
+    return dict((a["instance_id"], a["group"]) for a in session.get("spawned_actors", [])
+                if a.get("group"))
+
+
+def merge_groups(records, masks, groups, depth_mm, criterion, depth_scale, min_area_px):
+    """Un record per gruppo: box, area e distanza sull'unione delle maschere dei pezzi.
+
+    Il record unito tiene tag e id del pezzo piu' grande e la lista "parts" di
+    tutte le coppie (tag, id): carla_gt.record_mask() la usa per ricostruire la
+    maschera esatta. La soglia di area vale per l'oggetto intero, non per i pezzi:
+    a distanza l'asta e' sotto i 64 px ma fa parte del monopattino.
+    """
+    if not groups:
+        return records
+    out, parts_by_group = [], {}
+    for rec, mask in zip(records, masks):
+        group = groups.get(rec["instance_id"])
+        if group is None:
+            if rec["area_px"] >= min_area_px:
+                out.append(rec)
+            continue
+        parts_by_group.setdefault(group, []).append((rec, mask))
+    for group, parts in sorted(parts_by_group.items()):
+        union = np.zeros_like(parts[0][1])
+        for _, m in parts:
+            union |= m
+        area = int(union.sum())
+        if area < min_area_px:
+            continue
+        rows, cols = np.nonzero(union)
+        y0, y1, x0, x1 = int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
+        bbox = [x0, y0, x1 - x0 + 1, y1 - y0 + 1]
+        main = max(parts, key=lambda p: p[0]["area_px"])[0]
+        merged = dict(main)
+        merged.update({
+            "bbox": bbox,
+            "area_px": area,
+            "truncated": any(p["truncated"] for p, _ in parts),
+            "distance_m": distance_from_depth(depth_mm, union, bbox, criterion, depth_scale),
+            "group": group,
+            "parts": [[p["carla_tag"], p["instance_id"]] for p, _ in parts],
+        })
+        out.append(merged)
+    return out
+
+
 def distance_from_depth(depth_mm, mask, bbox, criterion, depth_scale):
     """Distanza in metri dell'istanza, secondo il criterio scelto.
 
@@ -109,7 +162,7 @@ def distance_from_depth(depth_mm, mask, bbox, criterion, depth_scale):
     return float(np.median(vals)) / depth_scale
 
 
-def instances_in_frame(instance_img, override, min_area_px):
+def instances_in_frame(instance_img, override, min_area_px, keep_ids=frozenset()):
     """Istanze presenti in un frame, come (tag, instance_id, maschera, bbox, area).
 
     cv2 legge in BGR, quindi il canale del tag semantico e' l'indice 2. Per
@@ -126,6 +179,9 @@ def instances_in_frame(instance_img, override, min_area_px):
     raggruppare: su una scena urbana sono la larga maggioranza, e tenerli
     significherebbe ordinare 762.000 elementi per frame invece di poche decine di
     migliaia.
+
+    keep_ids: id che passano anche sotto min_area_px, perche' sono pezzi di un
+    oggetto composto e la soglia si applica all'oggetto intero (merge_groups).
     """
     tags = instance_img[:, :, 2].astype(np.uint32)
     ids = (instance_img[:, :, 0].astype(np.uint32) << 8) | instance_img[:, :, 1].astype(np.uint32)
@@ -149,7 +205,7 @@ def instances_in_frame(instance_img, override, min_area_px):
     out = []
     for key, s, e in zip(uniq, starts, ends):
         area = int(e - s)
-        if area < min_area_px:
+        if area < min_area_px and int(key % 65536) not in keep_ids:
             continue
         pix = pix_sorted[s:e]
         rows, cols = np.divmod(pix, width)
@@ -171,6 +227,7 @@ def instances_in_frame(instance_img, override, min_area_px):
 def export(session_dir, criterion, min_area_px):
     session = load_session(session_dir)
     override = build_override(session)
+    groups = build_groups(session)
     depth_scale = session["depth_scale"]
 
     out_dir = os.path.join(session_dir, "export")
@@ -194,8 +251,8 @@ def export(session_dir, criterion, min_area_px):
             if inst_img is None or depth_mm is None:
                 sys.exit("frame %s incompleto: instance o depth mancante" % stem)
 
-            records = []
-            for inst in instances_in_frame(inst_img, override, min_area_px):
+            records, masks = [], []
+            for inst in instances_in_frame(inst_img, override, min_area_px, frozenset(groups)):
                 # L'override viene PRIMA del tag: e' l'unica precedenza corretta,
                 # perche' un'elettrica e un'utilitaria condividono il tag Car e
                 # solo l'id le distingue.
@@ -210,9 +267,7 @@ def export(session_dir, criterion, min_area_px):
 
                 dist = distance_from_depth(depth_mm, inst["mask"], inst["bbox"],
                                            criterion, depth_scale)
-                if dist is None:
-                    no_distance += 1
-
+                masks.append(inst["mask"])
                 records.append({
                     "instance_id": inst["instance_id"],
                     "carla_tag": inst["carla_tag"],
@@ -228,8 +283,14 @@ def export(session_dir, criterion, min_area_px):
                     "distance_criterion": criterion,
                     "source": source,
                 })
-                per_class_instances[boss] += 1
-                per_class_frames[boss].add(pose["index"])
+
+            records = merge_groups(records, masks, groups, depth_mm, criterion, depth_scale,
+                                   min_area_px)
+            for rec in records:
+                if rec["distance_m"] is None:
+                    no_distance += 1
+                per_class_instances[rec["boss_class"]] += 1
+                per_class_frames[rec["boss_class"]].add(pose["index"])
                 total_instances += 1
 
             ann.write(json.dumps({
