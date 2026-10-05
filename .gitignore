@@ -18,6 +18,7 @@ test_images/
 PIANO_Dati_Sintetici_OR4.1.MD
 **/CARLA/outputs/
 /claude
+*/bakeoff_clip
 # --- locale alla workstation, fuori dal repo -------------------------------
 # Su Git va cio' che gira sul pod, piu' il verbale delle fasi chiuse. Questi
 # provano che un ambiente locale funziona: sul pod la stessa cosa la fa
