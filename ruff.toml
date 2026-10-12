@@ -1,0 +1,9 @@
+# Unica impostazione: dove stanno i moduli del progetto.
+#
+# Le cartelle di synthetic_data_pipeline sono script che si importano fra loro per
+# nome (from carla_gt import ..., from sam_selezione import ...), anche da una
+# cartella all'altra via sys.path. Senza questa riga ruff li riconosce come moduli
+# nostri solo se viene lanciato da dentro la loro cartella; lanciato dalla radice,
+# come fa l'hook di .claude, li scambia per librerie esterne e segnala un falso
+# I001 (ordine degli import). Le regole attive restano quelle di default di ruff.
+src = [".", "synthetic_data_pipeline/*", "object_detection"]
