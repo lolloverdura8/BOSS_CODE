@@ -34,6 +34,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import gpu
+import sim2real
 
 # NORMALIZZAZIONE CHE RENDE CONFRONTABILI I MODELLI. Ogni generatore ha il suo
 # conteggio nativo di frame (73, 81, 121...), ma il giudizio di SAM e DA3 deve
@@ -110,16 +111,37 @@ def check_frames(frames, modello):
     a = np.asarray(frames)
     if a.ndim != 4 or a.shape[-1] != 3:
         raise ValueError("%s: attesi frame (T, H, W, 3), ricevuto %s" % (modello, (a.shape,)))
+    # NaN e infiniti (un passo bf16 andato storto) diventerebbero numeri a caso nel
+    # cast a uint8, e la clip risulterebbe "ok".
+    if a.dtype != np.uint8 and not np.isfinite(a).all():
+        raise ValueError(f"{modello}: frame con NaN o infiniti")
     if a.dtype == np.uint8 or a.max() > 1.5:
         print("  frame %s in 0..%g: normalizzati a float 0..1" % (a.dtype, a.max()))
         a = a.astype(np.float32) / 255.0
     return a
 
 
-def save_frames(frames, frame_dir):
+def call_generate(adapter, handle, job):
+    """generate() con o senza i controlli del job.
+
+    Solo i job del ramo Sim2Real hanno "control" (video di controllo di CARLA): agli
+    adapter text-to-video si continua a chiedere generate(handle, prompt, seed) e
+    non cambiano di una riga.
+    """
+    if "control" in job:
+        return adapter.generate(handle, job["prompt"], job["seed"], job["control"])
+    return adapter.generate(handle, job["prompt"], job["seed"])
+
+
+def save_frames(frames, frame_dir, all_frames=False):
+    """PNG lossless dei frame: i 19 di valutazione, oppure tutti.
+
+    all_frames per il ramo Sim2Real: la Fase 4 confronta ogni frame con la GT di
+    CARLA dello stesso istante, e 19 campioni lascerebbero buchi nel confronto.
+    """
     from PIL import Image
     os.makedirs(frame_dir, exist_ok=True)
-    idx = eval_indices(len(frames))
+    idx = list(range(len(frames))) if all_frames else eval_indices(len(frames))
     for i in idx:
         img = (np.clip(frames[i], 0.0, 1.0) * 255.0).round().astype(np.uint8)
         Image.fromarray(img).save(os.path.join(frame_dir, "%03d.png" % i))
@@ -239,6 +261,31 @@ def registra_fallimento(name, jobs, out_root, costs, spec, errore):
     return {"ok": 0, "oom": 0, "errore": len(jobs), "saltate": 0}
 
 
+def read_records(manifest):
+    if not os.path.exists(manifest):
+        return []
+    with open(manifest, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def check_resume(jobs, todo, manifest):
+    """Si ferma se una clip Sim2Real gia' su disco e' di un job diverso da quello di adesso.
+
+    Per il text-to-video basta clip_id; per il Sim2Real no (vedi
+    sim2real.resume_mismatch). Si esce invece di rigenerare: decidere se buttare
+    clip pagate tocca a chi lancia, spostandole a mano.
+    """
+    fatti = [j for j in jobs if "control" in j and j not in todo]
+    if not fatti:
+        return
+    records = read_records(manifest)
+    motivi = [m for m in (sim2real.resume_mismatch(j, records) for j in fatti) if m]
+    if motivi:
+        elenco = "\n  ".join(motivi)
+        sys.exit(f"clip gia' presenti che non corrispondono ai job:\n  {elenco}\n"
+                 f"Spostarle fuori da {os.path.dirname(manifest)} per rigenerarle.")
+
+
 def generate_model(name, jobs, out_root, costs, dry_run):
     # Anche l'import puo' fallire: un adapter che importa un pacchetto assente
     # nel venv in uso solleva qui, prima ancora di vedere la GPU.
@@ -258,8 +305,19 @@ def generate_model(name, jobs, out_root, costs, dry_run):
     todo = [j for j in jobs if not os.path.exists(clip_paths(out_root, j)[0])]
     print("clip richieste: %d, gia' presenti: %d, da generare: %d"
           % (len(jobs), len(jobs) - len(todo), len(todo)))
+    check_resume(jobs, todo, manifest)
     if not todo or dry_run:
         return {"ok": 0, "oom": 0, "errore": 0, "saltate": len(jobs) - len(todo)}
+
+    # Un pacchetto del formato sbagliato (frame, fps, dimensioni) si scopre adesso,
+    # non dopo aver caricato il modello e generato la prima clip.
+    sbagliati = [m for m in (sim2real.check_against_spec(j["control"], spec)
+                             for j in todo if "control" in j) if m]
+    sbagliati += [f"{j['clip_id']}: manca {p} (jobs.jsonl va costruito dove stanno i pacchetti)"
+                  for j in todo if "control" in j for p in sim2real.missing_files(j["control"])]
+    if sbagliati:
+        return registra_fallimento(name, todo, out_root, costs, spec,
+                                   "pacchetti: " + "; ".join(sbagliati))
 
     # load() riceve i prompt perche' gli adapter con un text encoder pesante
     # (UMT5-XXL di Wan pesa 11,36 GB, quasi meta' del modello) li codificano
@@ -282,8 +340,18 @@ def generate_model(name, jobs, out_root, costs, dry_run):
             t0 = time.time()
             frames, esito, errore = None, "ok", ""
             try:
-                frames = check_frames(
-                    adapter.generate(handle, job["prompt"], job["seed"]), name)
+                if "control" in job:
+                    sim2real.verify_control_files(job["control"])
+                out = check_frames(call_generate(adapter, handle, job), name)
+                if "control" in job:
+                    # Un frame in piu' o un'altezza diversa sfasano la GT: la clip
+                    # non e' "ok" anche se il modello e' andato a buon fine.
+                    motivo = sim2real.check_control_output(out.shape, job["control"])
+                    if motivo:
+                        raise ValueError(motivo)
+                # frames si assegna solo a controlli passati: se no il blocco sotto
+                # scriverebbe l'mp4, che alla ripresa vale come clip completata.
+                frames = out
             except torch.cuda.OutOfMemoryError:
                 esito = "oom"
                 # un'eccezione a meta' pipe() salta maybe_free_model_hooks: senza
@@ -304,7 +372,7 @@ def generate_model(name, jobs, out_root, costs, dry_run):
             if frames is not None:
                 mp4, frame_dir, _ = clip_paths(out_root, job)
                 try:
-                    idx = save_frames(frames, frame_dir)
+                    idx = save_frames(frames, frame_dir, job.get("save_all_frames", False))
                     # prima un file temporaneo, poi il nome definitivo: l'mp4 e' il
                     # marcatore di clip completata, e un file troncato da
                     # un'interruzione non deve sembrarlo

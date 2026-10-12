@@ -11,6 +11,12 @@
 #
 #   python build_jobs.py --models wan22_5b,cogvideox15 --set bakeoff
 #   python build_jobs.py --models wan22_5b --set produzione --seeds 3
+#   python build_jobs.py --models cosmos_t25,wan22_fun5b_ctrl --set sim2real \
+#                        --packs /workspace/s2r_packs
+#
+# L'insieme sim2real e' diverso dagli altri due: non e' un prodotto modelli x
+# prompt, ma un job per pacchetto di CARLA/prepare_controls.py e per
+# configurazione dei controlli (sim2real.py), seed 0, con un prompt per scena.
 #
 # IL SEED NON DIPENDE DAL MODELLO. E' l'indice del prompt nell'ordine stabile di
 # prompts.all_prompts(), quindi la stessa scena chiede lo stesso rumore iniziale
@@ -22,6 +28,7 @@ import os
 import sys
 
 import prompts
+import sim2real
 
 ADAPTERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters")
 
@@ -62,12 +69,15 @@ def main():
     parser = argparse.ArgumentParser(description="Costruisce jobs.jsonl per runner.py.")
     parser.add_argument("--models", required=True,
                         help="nomi degli adapter separati da virgola, es. wan22_5b,ltx25")
-    parser.add_argument("--set", dest="which", choices=("bakeoff", "produzione"),
+    parser.add_argument("--set", dest="which", choices=("bakeoff", "produzione", "sim2real"),
                         default="bakeoff",
-                        help="bakeoff: %d prompt (%d per classe). produzione: tutti e %d"
+                        help="bakeoff: %d prompt (%d per classe). produzione: tutti e %d."
+                             " sim2real: un job per pacchetto e configurazione (--packs)"
                              % (len(prompts.bakeoff_prompts()),
                                 len(prompts.BAKEOFF_PROMPT_INDICES),
                                 len(prompts.all_prompts())))
+    parser.add_argument("--packs", default="/workspace/s2r_packs",
+                        help="solo con --set sim2real: cartella dei pacchetti di prepare_controls.py")
     parser.add_argument("--seeds", type=int, default=1,
                         help="repliche per prompt, con seed diversi (default 1)")
     parser.add_argument("--limit", type=int, default=None,
@@ -91,7 +101,20 @@ def main():
         print("ATTENZIONE: %s non contiene adapter, nessun controllo sui nomi."
               % ADAPTERS_DIR)
 
-    jobs = build(models, args.which, args.seeds)
+    if args.which == "sim2real":
+        if args.seeds != 1:
+            sys.exit("--set sim2real usa un seed solo (0): --seeds non si applica")
+        try:
+            jobs = sim2real.build_jobs(models, args.packs, prompts.SIM2REAL_PROMPTS)
+        except sim2real.Sim2RealError as e:
+            sys.exit(f"ERRORE: {e}")
+    else:
+        # Gli adapter sim2real vogliono i video di controllo: con un job di soli
+        # prompt fallirebbero clip per clip, a GPU accesa.
+        controllati = [m for m in models if m in sim2real.PACK_SUFFIX]
+        if controllati:
+            sys.exit(f"{', '.join(controllati)} va(nno) con --set sim2real")
+        jobs = build(models, args.which, args.seeds)
     if args.limit:
         jobs = jobs[:args.limit]
 

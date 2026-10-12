@@ -115,6 +115,59 @@ SUSPENDED = ("ramo_sporgente", "insegna_cartello_basso", "ostacolo_sospeso_gener
 CLASS_ORDER = ("monopattino",) + SUSPENDED
 
 
+# --- Sim2Real (Fase 3) -------------------------------------------------------------
+#
+# Qui il prompt NON e' la variabile controllata del bake-off: la scena la fissano i
+# controlli di CARLA (depth, bordi, segmentazione). Il testo dice al modello COME
+# devono apparire le cose, non dove stanno ne' a che quota: quella e' gia' nei
+# controlli, e ripeterla rischierebbe di contraddirli.
+#
+# Base comune: la scena del viale del seme 2 di Town10HD (alberi a sinistra, case in
+# mattoni con le scale d'ingresso a destra, auto parcheggiate), vista nelle anteprime
+# del 05/10. In coda la formula della ricetta CARLA -> Cosmos (example_data/prompts/
+# rain.toml, carla-simulator/carla ue4-dev), che chiede realismo e struttura invariata.
+SIM2REAL_BASE = (
+    "POV video from a pedestrian walking along a tree-lined residential sidewalk on a sunny "
+    "day, brick townhouses with front stoops and railings on the right, parked cars along "
+    "the street on the left, {obj}. ")
+SIM2REAL_TAIL = (
+    "cinematic, photorealistic, ultra high quality, ultra high resolution, high fidelity, "
+    "high definition, expert cinematography, realism, structure of the scene maintained.")
+
+SIM2REAL_OBJECTS = {
+    "s2r_ramo": ("a leafy maple branch hanging low over the sidewalk from a street tree on "
+                 "the left"),
+    "s2r_ramo_fronda": ("a dense leafy oak bough hanging low over the sidewalk from a street "
+                        "tree on the left"),
+    "s2r_insegna": "a red and white no-parking traffic sign on a metal pole on the sidewalk",
+    "s2r_sospeso_generico": ("a metal air-conditioning unit mounted on a pole above the "
+                             "sidewalk"),
+    "s2r_monopattino": ("a person riding an electric kick scooter towards the camera along "
+                        "the sidewalk"),
+}
+
+SIM2REAL_PROMPTS = {scene: SIM2REAL_BASE.format(obj=obj) + SIM2REAL_TAIL
+                    for scene, obj in SIM2REAL_OBJECTS.items()}
+
+# Negativo per Cosmos: quello della stessa ricetta CARLA (rain.toml), scritto contro
+# l'aspetto da videogioco, che e' esattamente il rischio di partire da CARLA. Wan Fun
+# usa invece il suo negativo ufficiale, NEGATIVE_PROMPT qui sopra.
+SIM2REAL_NEGATIVE_COSMOS = (
+    "The video captures a game with low resolution graphics. The video is a cartoon. It "
+    "represents a recording of old outdated games. The images are very pixelated and of poor "
+    "CG quality. There are many subtitles in the footage. Overall, the video is unrealistic "
+    "and appears cg. The video lacks contrast and detail. Everything looks the same with a "
+    "lack of visual interest in color. Everything looks grey and metallic. The video captures "
+    "a series of frames showing ugly scenes, static with no motion, motion blur, "
+    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly "
+    "lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, "
+    "choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural "
+    "transitions, outdated special effects, fake elements, unconvincing visuals, poorly "
+    "edited content, jump cuts, visual noise, and flickering. The video is of the lowest "
+    "quality. Vehicles change appearance. Vehicles are ignored. Scene is flat. Colors are "
+    "unrealistic.")
+
+
 def bakeoff_prompts():
     """Le coppie (classe, indice, prompt) del bake-off, in ordine stabile."""
     out = []
