@@ -113,6 +113,42 @@ def test_seed_zero_avvisa():
     assert "seed 0" not in stampato, stampato
 
 
+LOG_OPENSORA = (
+    "[\x1b[34m2026-10-20 10:00:00\x1b[0m] CUDA max memory max memory allocated at build model: 30.2 GB\n"
+    "[\x1b[34m2026-10-20 10:00:00\x1b[0m] CUDA max memory max memory reserved at build model: 31.0 GB\n"
+    "[\x1b[34m2026-10-20 10:09:00\x1b[0m] CUDA max memory max memory allocated at inference: 52.5 GB\n"
+    "[\x1b[34m2026-10-20 10:09:00\x1b[0m] CUDA max memory max memory reserved at inference: 60.3 GB\n"
+)
+
+
+def test_picco_vram_letto_dal_log_di_inference():
+    # Il runner misura la VRAM nel proprio processo: per Open-Sora, che genera in
+    # torchrun, darebbe zero. Il picco vero lo stampa Open-Sora a fine inferenza.
+    m = opensora2.memoria_da_log(LOG_OPENSORA)
+    assert m == {"vram_alloc_peak_gb_torchrun": 52.5, "vram_reserved_peak_gb_torchrun": 60.3}, m
+
+
+def test_picco_vram_assente_dal_log_resta_none():
+    m = opensora2.memoria_da_log("nessuna riga utile")
+    assert m == {"vram_alloc_peak_gb_torchrun": None, "vram_reserved_peak_gb_torchrun": None}, m
+
+
+def test_metriche_della_clip_dopo_generate():
+    # torchrun fallisce, ma il log c'e': le metriche della clip devono riflettere
+    # l'ultima chiamata, non restare quelle di una clip precedente.
+    handle = {"repo": HERE}
+    originale = subprocess.run
+    subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="", stderr=LOG_OPENSORA)
+    try:
+        try:
+            opensora2.generate(handle, "p", 1)
+        except RuntimeError:
+            pass
+    finally:
+        subprocess.run = originale
+    assert opensora2.metriche_clip(handle)["vram_alloc_peak_gb_torchrun"] == 52.5
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

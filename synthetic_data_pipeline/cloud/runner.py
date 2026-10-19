@@ -368,6 +368,12 @@ def generate_model(name, jobs, out_root, costs, dry_run):
                           eval_frames=EVAL_FRAMES, errore=errore,
                           adapter_spec=spec,
                           usd_stimati=round(elapsed / 3600 * costs.rate, 4), **snap)
+            # Un adapter che genera in un sottoprocesso (Open-Sora) ha la VRAM fuori
+            # da questo processo, e snap ne vede ~0: il suo picco lo passa da qui.
+            if hasattr(adapter, "metriche_clip"):
+                extra = adapter.metriche_clip(handle)
+                record.update(extra)
+                print(f"  dall'adapter: {json.dumps(extra)}", flush=True)
 
             if frames is not None:
                 mp4, frame_dir, _ = clip_paths(out_root, job)

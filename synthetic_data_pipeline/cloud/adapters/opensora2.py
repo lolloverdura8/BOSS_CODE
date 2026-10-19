@@ -40,6 +40,7 @@
 # non e' un solo repo HuggingFace da scaricare, sono quattro cose in una cartella.
 import glob
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -136,6 +137,26 @@ def _diagnosi(r):
             f"--- stdout (ultime {CODA_RIGHE} righe) ---\n{_coda(r.stdout)}")
 
 
+# La VRAM che il runner misura e' quella del suo processo: qui la generazione sta in
+# torchrun, quindi il suo picco sarebbe ~0. Il picco vero lo stampa Open-Sora stesso
+# (log_cuda_max_memory in opensora/utils/misc.py) a fine inferenza, e si legge da li'.
+_RIGA_MEMORIA = re.compile(r"max memory (allocated|reserved) at inference: ([0-9.]+) GB")
+
+
+def memoria_da_log(testo):
+    """Picchi di VRAM (GB) dell'inferenza dal log di Open-Sora, None se mancano."""
+    m = {"vram_alloc_peak_gb_torchrun": None, "vram_reserved_peak_gb_torchrun": None}
+    for tipo, gb in _RIGA_MEMORIA.findall(testo or ""):
+        chiave = "alloc" if tipo == "allocated" else "reserved"
+        m[f"vram_{chiave}_peak_gb_torchrun"] = float(gb)
+    return m
+
+
+def metriche_clip(handle):
+    """Campi in piu' per la riga di manifest dell'ultima clip; il runner li aggiunge."""
+    return dict(handle.get("memoria") or memoria_da_log(""))
+
+
 def comando(prompt, seed, out_dir):
     """La riga di torchrun per una clip.
 
@@ -164,10 +185,12 @@ def generate(handle, prompt, seed):
     # Una cartella vuota per clip: il nome del file lo decide get_save_path_name
     # dentro il repo e non e' prevedibile da qui, quindi invece di indovinarlo si
     # prende l'unico mp4 che compare.
+    handle["memoria"] = None
     out_dir = tempfile.mkdtemp(prefix="opensora_")
     try:
         cmd = comando(prompt, seed, out_dir)
         r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True, check=False)
+        handle["memoria"] = memoria_da_log(f"{r.stdout}\n{r.stderr}")
         if r.returncode != 0:
             raise RuntimeError(_diagnosi(r))
         mp4 = sorted(glob.glob(os.path.join(out_dir, "**", "*.mp4"), recursive=True))

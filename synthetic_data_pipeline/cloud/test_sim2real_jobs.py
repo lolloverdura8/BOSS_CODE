@@ -302,6 +302,33 @@ def records_of(out_root):
     return runner.read_records(os.path.join(out_root, "finto_s2r", "manifest.jsonl"))
 
 
+def test_runner_aggiunge_le_metriche_clip_dell_adapter():
+    # Open-Sora genera in un sottoprocesso: la VRAM del runner non e' la sua, e
+    # l'adapter passa il picco vero con metriche_clip(handle).
+    spec = {"num_frames": 6, "fps": 24, "width": 8, "height": 4}
+    root = tempfile.mkdtemp(prefix="s2r_metriche_")
+    try:
+        packs, out = os.path.join(root, "packs"), os.path.join(root, "out")
+        os.makedirs(packs)
+        make_pack(packs, "s2r_ramo", "wanfun", n_frames=6, fps=24, size=(8, 4))
+        jobs = [dict(j, modello="finto_s2r") for j in
+                S.build_jobs(["wan22_fun5b_ctrl"], packs, prompts.SIM2REAL_PROMPTS)][:1]
+        with FakeRunnerEnv((6, 4, 8, 3)) as env:
+            originale = env.adapter
+
+            def con_metriche(spec_):
+                a = originale(spec_)
+                a.metriche_clip = lambda h: {"vram_alloc_peak_gb_torchrun": 52.5}
+                return a
+
+            env.adapter = con_metriche
+            esiti = run_model(env, spec, jobs, out)
+        assert esiti["ok"] == 1, esiti
+        assert records_of(out)[0]["vram_alloc_peak_gb_torchrun"] == 52.5
+    finally:
+        shutil.rmtree(root)
+
+
 def test_runner_sim2real_end_to_end():
     spec = {"num_frames": 6, "fps": 24, "width": 8, "height": 4}
     root = tempfile.mkdtemp(prefix="s2r_runner_")
