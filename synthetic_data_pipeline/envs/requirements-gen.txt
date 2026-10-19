@@ -7,9 +7,9 @@
 #
 #   pip install -r requirements-gen.txt --extra-index-url https://download.pytorch.org/whl/cu128
 #
-# Copre: wan22_5b, cogvideox15, hunyuan15.
+# Copre: wan22_5b, cogvideox15, hunyuan15, ltx25 (diffusers 0.40.0 ha gia' LTX2Pipeline).
 # NON copre: wan22_a14b (vuole diffusers da main, vedi requirements-a14b.txt),
-#            opensora2 e ltx25 (pacchetti propri, installati dai loro repo).
+#            opensora2 (venv proprio, blocco opensora di setup_pod.sh).
 #
 # Escluso dal freeze: colorama (solo Windows).
 
