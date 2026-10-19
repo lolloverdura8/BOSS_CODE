@@ -15,6 +15,17 @@
 # HuggingFace hpcai-tech il 15/09/2026. Sta nel bake-off perche' il §2.4 del
 # deliverable OR4.1 lo nomina esplicitamente accanto a Wan2.2 e CogVideoX.
 #
+# NON PIU' MANTENUTO (verificato il 19/10/2026). L'ultimo commit di codice e'
+# d0cd5ac del 27/03/2025; dopo c'e' solo un banner nel README (09/04/2026). Le
+# issue le chiude un bot di stale senza risposte, le PR esterne restano aperte.
+# Il repo si fissa a quel commit (OPENSORA_COMMIT in setup_pod.sh) e i bug che
+# troviamo vanno corretti qui: a monte non arriveranno fix.
+#
+# SEED 0. inference.py passa al campionatore "seed if seed else None": con seed 0
+# il rumore latente torna casuale e la clip non si riproduce. Con lo schema di
+# build_jobs (seed = indice globale del prompt) succede solo a monopattino_00.
+# Si dichiara nello SPEC, quindi nel manifest, e il runner lo stampa.
+#
 # ASIMMETRIA DA DICHIARARE NEL REPORT, NON DA NASCONDERE. Gli altri cinque
 # adapter restituiscono l'array di pixel della pipeline, e i PNG per SAM e DA3
 # escono da li', senza compressione. Qui i pixel si possono rileggere solo
@@ -22,12 +33,11 @@
 # handicap reale e misurabile su un modello soltanto: SPEC["pixel_source"] lo
 # porta nel manifest e da li' nel report.
 #
-# SETUP SUL POD (setup_pod.sh, non qui):
-#   git clone https://github.com/hpcaitech/Open-Sora
-#   installazione secondo il README del repo (colossalai, flash-attn)
-#   ckpts/ popolata: Open_Sora_v2.safetensors, hunyuan_vae.safetensors,
-#   google/t5-v1_1-xxl, openai/clip-vit-large-patch14. Non e' un solo repo
-#   HuggingFace da scaricare: sono quattro cose in una cartella.
+# SETUP SUL POD: "bash setup_pod.sh opensora", non qui. Clona il repo al commit
+# fissato, installa nel solo venv opensora (colossalai, flash-attn) e TensorNVMe da
+# sorgente, e controlla che ckpts/ abbia Open_Sora_v2.safetensors,
+# hunyuan_vae.safetensors, google/t5-v1_1-xxl e openai/clip-vit-large-patch14:
+# non e' un solo repo HuggingFace da scaricare, sono quattro cose in una cartella.
 import glob
 import os
 import shutil
@@ -61,6 +71,11 @@ SPEC = {
     "negative": None,
     # Vedi l'asimmetria in testa al file.
     "pixel_source": "mp4 (H.264)",
+    # Stesso valore di OPENSORA_COMMIT in setup_pod.sh: lo controlla il test.
+    "repo_commit": "d0cd5ac50da79e9a9d2285a952d4dcd806e6c8fc",
+    "manutenzione": "non piu' mantenuto dal 03/2025 (ultimo commit di codice d0cd5ac, 27/03/2025)",
+    "seed_rumore": "sampling_option.seed = seed; seed 0 diventa None in inference.py, "
+                   "quindi rumore casuale e clip non riproducibile",
 }
 
 
@@ -73,12 +88,12 @@ def load(prompts):
     pagano una volta sola.
     """
     if not os.path.isdir(REPO_DIR):
-        raise SystemExit("Open-Sora non trovato in %s. Impostare OPENSORA_DIR o clonare"
-                         " il repo (vedi setup_pod.sh)." % REPO_DIR)
+        raise SystemExit(f"Open-Sora non trovato in {REPO_DIR}. Impostare OPENSORA_DIR o"
+                         " clonare il repo (vedi setup_pod.sh).")
     cfg = os.path.join(REPO_DIR, SPEC["config"])
     if not os.path.exists(cfg):
-        raise SystemExit("config non trovato: %s" % cfg)
-    print("Open-Sora: repo %s, config %s" % (REPO_DIR, SPEC["config"]))
+        raise SystemExit(f"config non trovato: {cfg}")
+    print(f"Open-Sora: repo {REPO_DIR}, config {SPEC['config']}")
     print("NOTA: i pesi si ricaricano a ogni clip, M7 ne risente.")
     return {"repo": REPO_DIR}
 
@@ -89,7 +104,7 @@ def _read_video(path):
     frames = [np.asarray(f) for f in reader]
     reader.close()
     if not frames:
-        raise RuntimeError("nessun frame leggibile in %s" % path)
+        raise RuntimeError(f"nessun frame leggibile in {path}")
     # uint8 0..255 -> float 0..1, il contratto degli adapter. check_frames del
     # runner lo farebbe comunque, ma meglio che il contratto lo rispetti chi lo deve.
     return np.stack(frames).astype(np.float32) / 255.0
@@ -116,40 +131,51 @@ def _diagnosi(r):
     col solo stderr si legge il fallimento del launcher, non cio' che l'ha
     causato.
     """
-    return ("torchrun uscito con %d.\n\n--- stderr (ultime %d righe) ---\n%s"
-            "\n\n--- stdout (ultime %d righe) ---\n%s"
-            % (r.returncode, CODA_RIGHE, _coda(r.stderr), CODA_RIGHE, _coda(r.stdout)))
+    return (f"torchrun uscito con {r.returncode}.\n\n"
+            f"--- stderr (ultime {CODA_RIGHE} righe) ---\n{_coda(r.stderr)}\n\n"
+            f"--- stdout (ultime {CODA_RIGHE} righe) ---\n{_coda(r.stdout)}")
+
+
+def comando(prompt, seed, out_dir):
+    """La riga di torchrun per una clip.
+
+    merge_args di Open-Sora legge gli argomenti dopo il config a coppie
+    "--chiave valore": ogni flag qui deve avere il suo valore.
+    """
+    return [
+        "torchrun", "--nproc_per_node", "1", "--standalone",
+        "scripts/diffusion/inference.py", SPEC["config"],
+        "--save-dir", out_dir,
+        "--prompt", prompt,
+        "--num_frames", str(SPEC["num_frames"]),
+        "--aspect_ratio", SPEC["aspect_ratio"],
+        # --seed imposta solo set_seed globale. Il rumore latente lo decide
+        # sampling_option.seed, None per default: senza questo Open-Sora era
+        # l'unico modello del bake-off senza seed controllato.
+        "--seed", str(seed),
+        "--sampling_option.seed", str(seed),
+    ]
 
 
 def generate(handle, prompt, seed):
+    if seed == 0:
+        print("  attenzione: seed 0, Open-Sora lo tratta come None e il rumore e' casuale"
+              " (vedi SPEC['seed_rumore'])")
     # Una cartella vuota per clip: il nome del file lo decide get_save_path_name
     # dentro il repo e non e' prevedibile da qui, quindi invece di indovinarlo si
     # prende l'unico mp4 che compare.
     out_dir = tempfile.mkdtemp(prefix="opensora_")
     try:
-        cmd = [
-            "torchrun", "--nproc_per_node", "1", "--standalone",
-            "scripts/diffusion/inference.py", SPEC["config"],
-            "--save-dir", out_dir,
-            "--prompt", prompt,
-            "--num_frames", str(SPEC["num_frames"]),
-            "--aspect_ratio", SPEC["aspect_ratio"],
-            # seed di alto livello. ATTENZIONE: il config ha ANCHE
-            # sampling_option.seed, che e' il seed del rumore latente ed e' None
-            # per default. Se a S2 si scopre che questo --seed non rende
-            # deterministica la generazione, va passato anche quello, altrimenti
-            # Open-Sora e' l'unico modello del bake-off senza seed controllato.
-            "--seed", str(seed),
-        ]
-        r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True)
+        cmd = comando(prompt, seed, out_dir)
+        r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True, check=False)
         if r.returncode != 0:
             raise RuntimeError(_diagnosi(r))
         mp4 = sorted(glob.glob(os.path.join(out_dir, "**", "*.mp4"), recursive=True))
         if not mp4:
-            raise RuntimeError("nessun mp4 prodotto in %s, ma torchrun e' uscito con 0.\n%s"
-                               % (out_dir, _diagnosi(r)))
+            raise RuntimeError(f"nessun mp4 prodotto in {out_dir}, ma torchrun e' uscito"
+                               f" con 0.\n{_diagnosi(r)}")
         if len(mp4) > 1:
-            print("  attenzione: %d mp4 prodotti, prendo il primo" % len(mp4))
+            print(f"  attenzione: {len(mp4)} mp4 prodotti, prendo il primo")
         return _read_video(mp4[0])
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)

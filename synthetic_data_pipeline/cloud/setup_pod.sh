@@ -51,6 +51,13 @@ DA3_COMMIT="3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
 COSMOS_COMMIT="2ff49d0717af02057ae79bc75c00fbff9da1b4e7"
 VIDEOX_COMMIT="4b7b6402a1e0f0406bd6801fb66c0a00bd922621"
 COSMOS_GATED="nvidia/Cosmos-Transfer2.5-2B nvidia/Cosmos-Guardrail1 nvidia/Cosmos-Reason1-7B nvidia/Cosmos-Predict2.5-2B"
+# Open-Sora non e' piu' mantenuto (verificato il 19/10/2026): d0cd5ac del 27/03/2025
+# e' l'ultimo commit di codice, dopo c'e' solo il README. Lo stesso SHA sta in
+# SPEC["repo_commit"] dell'adapter, e test_opensora2.py controlla che coincidano.
+OPENSORA_COMMIT="d0cd5ac50da79e9a9d2285a952d4dcd806e6c8fc"
+# TensorNVMe: import non dichiarato di opensora/utils/ckpt.py, da sorgente perche'
+# la 0.1.0 su PyPI non ha async_file_io. Ultimo commit del main (27/11/2024).
+TENSORNVME_COMMIT="6403388f7c8929f43e407c8f7f39c6453d78c5d4"
 
 # Com'era la variabile PRIMA che la sovrascrivessimo: serve al blocco check
 # per accorgersi che la shell interattiva punta altrove.
@@ -63,6 +70,41 @@ want() {
   [ "${#SELECTED[@]}" -eq 0 ] && return 0
   for s in "${SELECTED[@]}"; do [ "$s" = "$1" ] && return 0; done
   return 1
+}
+
+# Il pip freeze dei venv che NON sono di Open-Sora, uno dopo l'altro. Il blocco
+# opensora lo prende prima e dopo: se cambia, ha toccato un ambiente non suo.
+# --all perche' senza pip non elenca pip, setuptools e wheel. Il confronto non vede
+# una reinstallazione alla stessa versione: e' un controllo sulle versioni, non sui file.
+freeze_altri() {
+  local v
+  for v in gen a14b ann fun; do
+    echo "## $v"
+    if [ -x "$VENVS/$v/bin/pip" ]; then
+      "$VENVS/$v/bin/pip" freeze --all || { echo "!!! pip freeze fallito nel venv $v" >&2; return 1; }
+    else
+      echo "(assente)"
+    fi
+  done
+}
+
+# La riga di ldd che risolve libaio per il .so di tensornvme ("" se non compare).
+# Solo libaio: le librerie di torch (libc10, libtorch) senza rpath risultano
+# "not found" a ldd anche quando l'import funziona.
+libaio_di() {
+  ldd "$1" | grep 'libaio' || true
+}
+
+# Il .so compilato di tensornvme, se c'e'. Vive nel venv opensora (sul volume), ma
+# la libaio di sistema a cui e' collegato sta sul container disk.
+tensornvme_so() {
+  "$VENVS/opensora/bin/python" - <<'PY' 2>/dev/null
+import glob, os, importlib.util
+spec = importlib.util.find_spec("tensornvme")
+if spec and spec.submodule_search_locations:
+    trovati = glob.glob(os.path.join(list(spec.submodule_search_locations)[0], "_C*.so"))
+    print(trovati[0] if trovati else "")
+PY
 }
 
 mkvenv() {  # mkvenv <nome> <requirements>
@@ -146,21 +188,122 @@ fi
 
 # --------------------------------------------------------------------------
 if want opensora; then
-  say "opensora: repo, dipendenze e checkpoint"
+  say "opensora: venv proprio, TensorNVMe da sorgente, checkpoint"
   # Open-Sora non e' un repo HuggingFace da scaricare e basta: vuole quattro
-  # cose dentro ckpts/ e un ambiente con colossalai. Ha il suo venv perche' le
-  # sue dipendenze non sono quelle degli altri generatori.
+  # cose dentro ckpts/ e un ambiente con colossalai e torch 2.4. Ha il suo venv
+  # perche' le sue dipendenze non sono quelle degli altri generatori, e OGNI pip
+  # di questo blocco passa dal path di quel venv: niente python di sistema, niente
+  # altri venv. L'unica cosa di sistema sono i pacchetti apt (libaio, cmake).
   dir="$WORKSPACE/Open-Sora"
+  tn="$WORKSPACE/TensorNVMe"
+  py="$VENVS/opensora/bin/python"
+  pip="$VENVS/opensora/bin/pip"
+  # pip muore con "Invalid cross-device link" fra /tmp e il volume MooseFS.
+  export TMPDIR="$WORKSPACE/tmp"
+  mkdir -p "$TMPDIR"
+  freeze_altri > "$TMPDIR/freeze_altri_prima.txt"
+
+  # libaio-dev: tensornvme si collega alla libaio di sistema. Sta sul container
+  # disk, quindi dopo un Terminate sparisce: il blocco check lo vede con ldd.
+  # cmake: lo chiama setup.py di tensornvme. Righe separate e ricontrollo dopo:
+  # in "update && install" un update fallito non ferma lo script, e senza cmake o
+  # libaio.h il setup.py di tensornvme ripiega in silenzio su una libaio compilata
+  # da pagure.io dentro il volume.
+  if ! command -v cmake >/dev/null || [ ! -e /usr/include/libaio.h ]; then
+    apt-get update -qq
+    apt-get install -y -qq libaio-dev cmake
+  fi
+  if ! command -v cmake >/dev/null || [ ! -e /usr/include/libaio.h ]; then
+    echo "!!! cmake o libaio.h ancora assenti dopo apt: mi fermo"
+    exit 1
+  fi
+
   [ -d "$dir/.git" ] || git clone https://github.com/hpcaitech/Open-Sora "$dir"
+  git -C "$dir" fetch --quiet origin
+  git -C "$dir" checkout --quiet "$OPENSORA_COMMIT"
+
   [ -d "$VENVS/opensora" ] || python3 -m venv "$VENVS/opensora"
-  "$VENVS/opensora/bin/pip" install --upgrade pip -q
-  echo ">>> installazione secondo il README di Open-Sora (colossalai, flash-attn):"
-  echo "    $VENVS/opensora/bin/pip install -v ."
-  echo "    eseguirla da $dir, e' lunga e vale la pena guardarla"
-  echo ">>> poi popolare $dir/ckpts/ con:"
-  echo "    Open_Sora_v2.safetensors, hunyuan_vae.safetensors,"
-  echo "    google/t5-v1_1-xxl, openai/clip-vit-large-patch14"
-  echo ">>> infine: export OPENSORA_DIR=$dir"
+  "$pip" install --upgrade pip -q
+  # Sul volume il venv c'e' gia' dal 18/09 (flash-attn, xformers): l'installazione
+  # completa del README parte solo se manca qualcosa. Da $TMPDIR e non dal clone:
+  # da li' "import opensora" riuscirebbe dai sorgenti anche senza pacchetto.
+  if ! (cd "$TMPDIR" && "$py" -c "import torch, colossalai, flash_attn, opensora"); then
+    echo ">>> ambiente Open-Sora incompleto (errore sopra): installazione da README"
+    (cd "$dir" && "$pip" install -v .)
+    "$pip" install xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu121
+    # Il setup.py di flash-attn importa torch: senza --no-build-isolation non lo vede.
+    "$pip" install flash-attn --no-build-isolation
+    echo "$OPENSORA_COMMIT" > "$VENVS/opensora/.opensora_commit"
+  fi
+  # "pip install ." non e' editabile: torchrun usa la copia in site-packages, non il
+  # clone, e il checkout sopra da solo non la cambia. Se la copia non viene dal
+  # commit fissato si reinstalla il solo pacchetto opensora, senza dipendenze:
+  # torch e flash-attn restano dove sono.
+  if [ "$(cat "$VENVS/opensora/.opensora_commit" 2>/dev/null)" != "$OPENSORA_COMMIT" ]; then
+    echo ">>> pacchetto opensora non registrato a ${OPENSORA_COMMIT:0:7}: lo reinstallo senza dipendenze"
+    (cd "$dir" && "$pip" install --no-deps --force-reinstall .)
+    echo "$OPENSORA_COMMIT" > "$VENVS/opensora/.opensora_commit"
+  fi
+  # hf_transfer: HF_HUB_ENABLE_HF_TRANSFER e' nell'immagine di RunPod.
+  # packaging e click: li vuole il setup.py di tensornvme, che qui gira senza deps.
+  # imageio, imageio-ffmpeg, psutil: runner.py gira dentro questo venv (torchrun va
+  # preso da qui) e scrive l'mp4 con imageio dove diffusers non c'e'. Stesse
+  # versioni del venv gen.
+  "$pip" install -q hf_transfer packaging click \
+    ImageIO==2.37.4 imageio-ffmpeg==0.6.0 psutil==7.2.2
+
+  [ -d "$tn/.git" ] || git clone https://github.com/hpcaitech/TensorNVMe.git "$tn"
+  git -C "$tn" fetch --quiet origin
+  git -C "$tn" checkout --quiet "$TENSORNVME_COMMIT"
+  if ! (cd "$TMPDIR" && "$py" -c "import tensornvme.async_file_io"); then
+    echo ">>> tensornvme assente o rotto (errore sopra): lo compilo"
+    # Tre trappole del setup.py di tensornvme:
+    # - scrive in ~/.tensornvme e appende a ~/.bashrc: con HOME sul volume non
+    #   tocca /root;
+    # - i requirements dichiarano torch: --no-deps, altrimenti pip puo' toccarlo;
+    # - ignora l'esito di cmake e make: l'import e ldd qui sotto sono la verifica.
+    # Si cancellano i resti di una compilazione precedente: una libaio lasciata in
+    # ~/.tensornvme/lib verrebbe presa dal linker prima di quella di sistema.
+    # DISABLE_URING: liburing andrebbe scaricata e compilata, e a noi non serve.
+    rm -rf "$WORKSPACE/tensornvme-home/.tensornvme" "$tn/build" "$tn/cmake-build"
+    mkdir -p "$WORKSPACE/tensornvme-home"
+    (cd "$tn" && HOME="$WORKSPACE/tensornvme-home" DISABLE_URING=1 \
+      "$pip" install -v --no-cache-dir --no-build-isolation --no-deps .)
+  fi
+  so="$(tensornvme_so || true)"
+  aio=""
+  if [ -n "$so" ]; then aio="$(libaio_di "$so")"; fi
+  case "$aio" in
+    *"not found"*|"")
+      echo "!!! tensornvme: libaio non risolta (${so:-.so non trovato}): $aio"; exit 1 ;;
+    *"$WORKSPACE"*)
+      echo "!!! tensornvme collegato a una libaio sul volume, non a quella di sistema: $aio"
+      exit 1 ;;
+    *) echo "tensornvme collegato a: $(echo "$aio" | xargs)" ;;
+  esac
+  # Da una cartella neutra, non da $dir: torchrun lancia scripts/diffusion/
+  # inference.py, quindi opensora arriva dal venv e non dal clone, e la verifica
+  # deve vedere la stessa cosa.
+  (cd "$TMPDIR" && "$py" -c "import tensornvme.async_file_io, opensora.utils.ckpt as c;
+print('tensornvme e opensora.utils.ckpt importabili, opensora da', c.__file__)")
+
+  "$pip" freeze --all > "$VENVS/requirements-opensora.lock"
+  echo "versioni installate in $VENVS/requirements-opensora.lock (da riportare nel repo)"
+
+  freeze_altri > "$TMPDIR/freeze_altri_dopo.txt"
+  if diff -u "$TMPDIR/freeze_altri_prima.txt" "$TMPDIR/freeze_altri_dopo.txt"; then
+    echo "venv gen, a14b, ann, fun invariati"
+  else
+    echo "!!! il blocco opensora ha cambiato un venv che non e' suo (diff sopra)"
+    exit 1
+  fi
+
+  for c in Open_Sora_v2.safetensors hunyuan_vae.safetensors google/t5-v1_1-xxl \
+           openai/clip-vit-large-patch14; do
+    if [ -e "$dir/ckpts/$c" ]; then echo "ckpts/$c presente"; else echo "!!! ckpts/$c MANCA"; fi
+  done
+  echo "Open-Sora @ $(git -C "$dir" rev-parse --short HEAD), TensorNVMe @ $(git -C "$tn" rev-parse --short HEAD)"
+  echo ">>> prima di runner.py: export OPENSORA_DIR=$dir"
 fi
 
 # --------------------------------------------------------------------------
@@ -261,6 +404,29 @@ if want check; then
     printf '%-9s assente\n' cosmos
   fi
 
+  # tensornvme sta nel venv opensora, sul volume, ma la libaio di sistema a cui e'
+  # collegato sta sul container disk: dopo un Terminate l'import di Open-Sora
+  # fallisce anche se il venv e' intatto. Si guarda con ldd e si rimette da apt.
+  so="$(tensornvme_so || true)"
+  if [ -n "$so" ]; then
+    case "$(libaio_di "$so")" in
+      *"not found"*)
+        echo "tensornvme: libaio mancante, reinstallo libaio-dev"
+        apt-get update -qq
+        apt-get install -y -qq libaio-dev
+        case "$(libaio_di "$so")" in
+          *"not found"*) echo "!!! tensornvme: libaio ancora mancante dopo apt" ;;
+        esac ;;
+    esac
+    if (cd /tmp && "$VENVS/opensora/bin/python" -c "import tensornvme.async_file_io"); then
+      echo "tensornvme importabile ($(libaio_di "$so" | xargs))"
+    else
+      echo "!!! tensornvme NON importabile (errore sopra): rilanciare il blocco opensora"
+    fi
+  elif [ -x "$VENVS/opensora/bin/python" ]; then
+    echo "tensornvme assente nel venv opensora: lanciare il blocco opensora"
+  fi
+
   # Cosmos vuole driver >= 570.124.06 e glibc >= 2.35 (docs/setup.md del repo):
   # su una macchina nuova si guarda prima di installare.
   echo "driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)" \
@@ -290,6 +456,10 @@ PY
   echo "  cd $CLOUD"
   echo "  $VENVS/gen/bin/python build_jobs.py --models wan22_5b --set bakeoff --out $WORKSPACE/jobs.jsonl"
   echo "  $VENVS/gen/bin/python runner.py --jobs $WORKSPACE/jobs.jsonl --out-root $WORKSPACE/out --limit 1"
+  echo "Open-Sora (venv attivato: torchrun lo prende dal PATH):"
+  echo "  source $VENVS/opensora/bin/activate && export OPENSORA_DIR=$WORKSPACE/Open-Sora"
+  echo "  python build_jobs.py --models opensora2 --set bakeoff --out $WORKSPACE/jobs_os.jsonl"
+  echo "  python runner.py --jobs $WORKSPACE/jobs_os.jsonl --out-root $WORKSPACE/out_os --limit 1"
   echo "ramo Sim2Real (pacchetti in $WORKSPACE/s2r_packs):"
   echo "  $VENVS/gen/bin/python build_jobs.py --models cosmos_t25,wan22_fun5b_ctrl --set sim2real --packs $WORKSPACE/s2r_packs --out $WORKSPACE/jobs_s2r.jsonl"
   echo "  $VENVS/gen/bin/python runner.py --jobs $WORKSPACE/jobs_s2r.jsonl --out-root $WORKSPACE/out_s2r --models cosmos_t25 --limit 1"
