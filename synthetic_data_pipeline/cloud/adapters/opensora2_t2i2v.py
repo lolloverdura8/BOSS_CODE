@@ -13,15 +13,25 @@
 # modello in piu' pero' si paga in secondi per clip e VRAM, e il manifest lo
 # riporta cosi' com'e'.
 #
+# OFFLOAD. Senza, sulla A100 da 80 GB va in OOM (21/10/2026, 19:12): Flux genera il
+# fotogramma, poi al caricamento del modello video la memoria finisce, con 74 GB
+# allocati. offload_model sposta sulla CPU il modello che in quel momento non lavora.
+# Cambia dove stanno i pesi, non i calcoli; costa i trasferimenti, che finiscono nei
+# secondi per clip. Il README di Open-Sora scrive "--offload True", ma inference.py
+# legge cfg["offload_model"]: con "--offload" la chiave impostata non la legge nessuno.
+#
 # LICENZA: FLUX.1-dev e' distribuito con licenza non commerciale. Va verificata
 # prima di usare queste clip nel dataset, non per le prove.
 from adapters import opensora2 as _base
+
+EXTRA = ("--offload_model", "True")
 
 SPEC = dict(
     _base.SPEC,
     config="configs/diffusion/inference/t2i2v_768px.py",
     modalita="t2i2v: FLUX.1-dev genera il primo fotogramma dal prompt, Open-Sora lo anima (i2v)",
     modelli_aggiuntivi="FLUX.1-dev 12B (ckpts/flux1-dev.safetensors, flux1-dev-ae.safetensors)",
+    offload_model=True,
     licenza="FLUX.1-dev: licenza non commerciale, da verificare per l'uso nel dataset",
 )
 
@@ -31,4 +41,4 @@ metriche_clip = _base.metriche_clip
 
 
 def load(prompts):
-    return _base.load(prompts, config=SPEC["config"])
+    return _base.load(prompts, config=SPEC["config"], extra=EXTRA)

@@ -80,7 +80,7 @@ SPEC = {
 }
 
 
-def load(prompts, config=None):
+def load(prompts, config=None, extra=()):
     """Non carica niente: il modello vive dentro il sottoprocesso.
 
     Il costo e' che i pesi si ricaricano a ogni clip, il che gonfia i secondi
@@ -90,6 +90,7 @@ def load(prompts, config=None):
 
     config: il file di configurazione di Open-Sora, relativo al repo. None vale
     SPEC["config"]; opensora2_t2i2v passa il suo.
+    extra: coppie "--chiave valore" in piu' per torchrun, accodate al comando.
     """
     config = config or SPEC["config"]
     if not os.path.isdir(REPO_DIR):
@@ -100,7 +101,7 @@ def load(prompts, config=None):
         raise SystemExit(f"config non trovato: {cfg}")
     print(f"Open-Sora: repo {REPO_DIR}, config {config}")
     print("NOTA: i pesi si ricaricano a ogni clip, M7 ne risente.")
-    return {"repo": REPO_DIR, "config": config}
+    return {"repo": REPO_DIR, "config": config, "extra": tuple(extra)}
 
 
 def _read_video(path):
@@ -161,7 +162,7 @@ def metriche_clip(handle):
     return dict(handle.get("memoria") or memoria_da_log(""))
 
 
-def comando(prompt, seed, out_dir, config=None):
+def comando(prompt, seed, out_dir, config=None, extra=()):
     """La riga di torchrun per una clip.
 
     merge_args di Open-Sora legge gli argomenti dopo il config a coppie
@@ -179,6 +180,7 @@ def comando(prompt, seed, out_dir, config=None):
         # l'unico modello del bake-off senza seed controllato.
         "--seed", str(seed),
         "--sampling_option.seed", str(seed),
+        *extra,
     ]
 
 
@@ -192,7 +194,7 @@ def generate(handle, prompt, seed):
     handle["memoria"] = None
     out_dir = tempfile.mkdtemp(prefix="opensora_")
     try:
-        cmd = comando(prompt, seed, out_dir, handle.get("config"))
+        cmd = comando(prompt, seed, out_dir, handle.get("config"), handle.get("extra", ()))
         r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True, check=False)
         handle["memoria"] = memoria_da_log(f"{r.stdout}\n{r.stderr}")
         if r.returncode != 0:

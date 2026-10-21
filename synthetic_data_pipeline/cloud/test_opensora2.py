@@ -168,7 +168,8 @@ def test_t2i2v_passa_il_suo_config_a_torchrun():
                                         subprocess.CompletedProcess(cmd, 3, "", "x"))[1]
     try:
         try:
-            opensora2_t2i2v.generate({"repo": HERE, "config": opensora2_t2i2v.SPEC["config"]}, "p", 5)
+            opensora2_t2i2v.generate({"repo": HERE, "config": opensora2_t2i2v.SPEC["config"],
+                                      "extra": opensora2_t2i2v.EXTRA}, "p", 5)
         except RuntimeError:
             pass
     finally:
@@ -176,11 +177,15 @@ def test_t2i2v_passa_il_suo_config_a_torchrun():
     cmd = chiamate[0]
     assert opensora2_t2i2v.SPEC["config"] in cmd and opensora2.SPEC["config"] not in cmd, cmd
     assert valore_dopo(cmd, "--sampling_option.seed") == "5"
+    # La chiave e' offload_model, quella che legge inference.py, non l'--offload del README.
+    assert valore_dopo(cmd, "--offload_model") == "True"
+    dopo_config = cmd[cmd.index(opensora2_t2i2v.SPEC["config"]) + 1:]
+    assert len(dopo_config) % 2 == 0 and all(k.startswith("--") for k in dopo_config[::2])
 
 
 def test_senza_config_nel_handle_resta_768px():
     cmd = opensora2.comando("p", 1, "/tmp/out", None)
-    assert opensora2.SPEC["config"] in cmd
+    assert opensora2.SPEC["config"] in cmd and "--offload_model" not in cmd
 
 
 if __name__ == "__main__":
