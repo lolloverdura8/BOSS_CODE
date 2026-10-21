@@ -80,23 +80,27 @@ SPEC = {
 }
 
 
-def load(prompts):
+def load(prompts, config=None):
     """Non carica niente: il modello vive dentro il sottoprocesso.
 
     Il costo e' che i pesi si ricaricano a ogni clip, il che gonfia i secondi
     per clip di M7. Va detto nel report: non e' che il modello sia piu' lento a
     generare, e' che questo adapter paga un caricamento per clip che gli altri
     pagano una volta sola.
+
+    config: il file di configurazione di Open-Sora, relativo al repo. None vale
+    SPEC["config"]; opensora2_t2i2v passa il suo.
     """
+    config = config or SPEC["config"]
     if not os.path.isdir(REPO_DIR):
         raise SystemExit(f"Open-Sora non trovato in {REPO_DIR}. Impostare OPENSORA_DIR o"
                          " clonare il repo (vedi setup_pod.sh).")
-    cfg = os.path.join(REPO_DIR, SPEC["config"])
+    cfg = os.path.join(REPO_DIR, config)
     if not os.path.exists(cfg):
         raise SystemExit(f"config non trovato: {cfg}")
-    print(f"Open-Sora: repo {REPO_DIR}, config {SPEC['config']}")
+    print(f"Open-Sora: repo {REPO_DIR}, config {config}")
     print("NOTA: i pesi si ricaricano a ogni clip, M7 ne risente.")
-    return {"repo": REPO_DIR}
+    return {"repo": REPO_DIR, "config": config}
 
 
 def _read_video(path):
@@ -157,7 +161,7 @@ def metriche_clip(handle):
     return dict(handle.get("memoria") or memoria_da_log(""))
 
 
-def comando(prompt, seed, out_dir):
+def comando(prompt, seed, out_dir, config=None):
     """La riga di torchrun per una clip.
 
     merge_args di Open-Sora legge gli argomenti dopo il config a coppie
@@ -165,7 +169,7 @@ def comando(prompt, seed, out_dir):
     """
     return [
         "torchrun", "--nproc_per_node", "1", "--standalone",
-        "scripts/diffusion/inference.py", SPEC["config"],
+        "scripts/diffusion/inference.py", config or SPEC["config"],
         "--save-dir", out_dir,
         "--prompt", prompt,
         "--num_frames", str(SPEC["num_frames"]),
@@ -188,7 +192,7 @@ def generate(handle, prompt, seed):
     handle["memoria"] = None
     out_dir = tempfile.mkdtemp(prefix="opensora_")
     try:
-        cmd = comando(prompt, seed, out_dir)
+        cmd = comando(prompt, seed, out_dir, handle.get("config"))
         r = subprocess.run(cmd, cwd=handle["repo"], capture_output=True, text=True, check=False)
         handle["memoria"] = memoria_da_log(f"{r.stdout}\n{r.stderr}")
         if r.returncode != 0:

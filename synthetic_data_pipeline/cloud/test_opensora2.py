@@ -16,7 +16,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from adapters import opensora2
+from adapters import opensora2, opensora2_t2i2v
 
 
 def valore_dopo(cmd, flag):
@@ -147,6 +147,40 @@ def test_metriche_della_clip_dopo_generate():
     finally:
         subprocess.run = originale
     assert opensora2.metriche_clip(handle)["vram_alloc_peak_gb_torchrun"] == 52.5
+
+
+def test_t2i2v_cambia_solo_il_config():
+    base, t2i2v = opensora2.SPEC, opensora2_t2i2v.SPEC
+    assert t2i2v["config"] == "configs/diffusion/inference/t2i2v_768px.py"
+    # Stessa risoluzione, fotogrammi, passi, commit: il confronto con opensora2
+    # deve differire solo per la modalita'.
+    for k in ("resolution", "aspect_ratio", "num_frames", "steps", "guidance", "repo_commit"):
+        assert t2i2v[k] == base[k], k
+    assert "FLUX" in t2i2v["modelli_aggiuntivi"] and "licenza" in t2i2v
+
+
+def test_t2i2v_passa_il_suo_config_a_torchrun():
+    # load() non si puo' chiamare senza il repo: il config arriva a generate dal
+    # handle, come farebbe load().
+    chiamate = []
+    originale = subprocess.run
+    subprocess.run = lambda cmd, **kw: (chiamate.append(cmd),
+                                        subprocess.CompletedProcess(cmd, 3, "", "x"))[1]
+    try:
+        try:
+            opensora2_t2i2v.generate({"repo": HERE, "config": opensora2_t2i2v.SPEC["config"]}, "p", 5)
+        except RuntimeError:
+            pass
+    finally:
+        subprocess.run = originale
+    cmd = chiamate[0]
+    assert opensora2_t2i2v.SPEC["config"] in cmd and opensora2.SPEC["config"] not in cmd, cmd
+    assert valore_dopo(cmd, "--sampling_option.seed") == "5"
+
+
+def test_senza_config_nel_handle_resta_768px():
+    cmd = opensora2.comando("p", 1, "/tmp/out", None)
+    assert opensora2.SPEC["config"] in cmd
 
 
 if __name__ == "__main__":
